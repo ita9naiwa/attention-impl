@@ -15,7 +15,6 @@
 
 
 // brought from vLLM code https://github.com/vllm-project/vllm/blob/main/csrc/reduction_utils.cuh
-//
 template<typename T>
 __inline__ __device__ T warpReduceSum(T val) {
 #pragma unroll

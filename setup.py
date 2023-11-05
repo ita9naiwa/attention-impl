@@ -5,7 +5,6 @@ setup(
     name='attention',
     ext_modules=[
         CUDAExtension('attention', [
-            'attention.cpp',
             'attention_kernel.cu',
         ]),
     ],
