@@ -134,13 +134,11 @@ std::vector<torch::Tensor> naive_attention_forward(
     auto context_len = Q.size(1);
     auto dim = Q.size(2);
     assert(dim % num_heads == 0);
+    torch::Device device(torch::kCUDA);
 
-    auto _Q = Q.reshape({batch_size, context_len, num_heads, dim / num_heads});
-    auto _K = K.reshape({batch_size, context_len, num_heads, dim / num_heads});
-    auto _V = V.reshape({batch_size, context_len, num_heads, dim / num_heads});
-    auto _S = torch::zeros({batch_size, num_heads, context_len, context_len}).cuda();
-    auto _P = torch::zeros({batch_size, num_heads, context_len, context_len}).cuda();
-    auto _O = torch::zeros_like(_Q);
+    auto S = torch::zeros({batch_size, num_heads, context_len, context_len}, device);
+    auto P = torch::zeros({batch_size, num_heads, context_len, context_len}, device);
+    auto O = torch::zeros_like(Q);
     const int threads = std::min((int)context_len, 1024);
     const dim3 blocks(batch_size, num_heads);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -152,18 +150,16 @@ std::vector<torch::Tensor> naive_attention_forward(
             naive_attention_forward_kernel<<<blocks, threads, context_len, stream>>>(
                 context_len,
                 dim / num_heads,
-                _Q.data_ptr<scalar_t>(),
-                _K.data_ptr<scalar_t>(),
-                _V.data_ptr<scalar_t>(),
-                _S.data_ptr<scalar_t>(),
-                _P.data_ptr<scalar_t>(),
-                _O.data_ptr<scalar_t>()
+                Q.data_ptr<scalar_t>(),
+                K.data_ptr<scalar_t>(),
+                V.data_ptr<scalar_t>(),
+                S.data_ptr<scalar_t>(),
+                P.data_ptr<scalar_t>(),
+                O.data_ptr<scalar_t>()
             );
         })
     );
-
-    auto O = _O.reshape({batch_size, context_len, dim});
-    return {_S, _P, O};
+    return {S, P, O};
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("naive_attention_forward", &naive_attention_forward, "forward");
