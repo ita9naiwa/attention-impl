@@ -52,6 +52,7 @@ __global__ void naive_attention_forward_kernel(
     scalar_t* __restrict__ Q,
     scalar_t* __restrict__ K,
     scalar_t* __restrict__ V,
+    scalar_t* __restrict__ mask,
     scalar_t* __restrict__ S,
     scalar_t* __restrict__ P,
     scalar_t* __restrict__ O
@@ -63,25 +64,31 @@ __global__ void naive_attention_forward_kernel(
     const int head_id       = blockIdx.y;
     const int batch_size    = gridDim.x;
     const int num_heads     = gridDim.y;
-    // Q has shape [batch_size, context_len, num_heads, dim]
 
+    // Q has shape      [batch_size, context_len, num_heads, dim]
+    // K has shape      [batch_size, context_len, num_heads, dim]
+    // mask has shape   [batch_size, context_len, context_len]
     for(int i = thread_id; i < context_len; i += block_dim) {
         for(int j = 0; j < context_len; ++j) {
-            for(int k = 0; k < dim; ++k) {
-                int Q_idx = (context_len * num_heads * dim) * batch_id + \
-                            (dim) * head_id + \
-                            (num_heads * dim) * i + k;
-                int K_idx = (context_len * num_heads * dim) * batch_id + \
-                            (dim) * head_id + \
-                            (num_heads * dim) * j + k;
-                int S_idx = (num_heads * context_len * context_len) * batch_id + \
-                            (context_len * context_len) * head_id + \
-                            (context_len) * i + j;
-                S[S_idx] += Q[Q_idx] * K[K_idx];
+            int S_idx = (num_heads * context_len * context_len) * batch_id + \
+                        (context_len * context_len) * head_id + \
+                        (context_len) * i + j;
+            if (mask[(context_len * context_len) * batch_id + context_len * i + j] > 0){
+                for(int k = 0; k < dim; ++k) {
+                    int Q_idx = (context_len * num_heads * dim) * batch_id + \
+                                (dim) * head_id + \
+                                (num_heads * dim) * i + k;
+                    int K_idx = (context_len * num_heads * dim) * batch_id + \
+                                (dim) * head_id + \
+                                (num_heads * dim) * j + k;
+                    S[S_idx] += Q[Q_idx] * K[K_idx];
+                }
+            } else {
+                S[S_idx] = -100000.0;
             }
         }
     }
-    float val_max;
+
     float val_sum;
 
     int idx_beg = (num_heads * context_len * context_len) * batch_id + (context_len * context_len) * head_id;
@@ -90,12 +97,9 @@ __global__ void naive_attention_forward_kernel(
         val_sum = 1e-9;
         for(int j = thread_id; j < context_len; j += block_dim) {
             float exp_val = exp(S[idx_beg + context_len * i + j]);
-            // val_max = max(val_max, exp_val);
             val_sum += exp_val;
         }
         __syncthreads();
-        // why I can't reduce these two functions into single function and func pointer?
-        // val_max = blockReduceMax<float>(val_max);
         val_sum = blockReduceSum<float>(val_sum);
         for(int j = thread_id; j < context_len; j += block_dim) {
             float exp_val = exp(S[idx_beg + context_len * i + j]);
@@ -124,12 +128,13 @@ __global__ void naive_attention_forward_kernel(
 }
 
 std::vector<torch::Tensor> naive_attention_forward(
-    torch::Tensor &Q, // [batch_size, context_len, dim]
-    torch::Tensor &K, // [batch_size, context_len, dim]
-    torch::Tensor &V, // [batch_size, context_len, dim]
+    torch::Tensor &Q,       // [batch_size, context_len, dim]
+    torch::Tensor &K,       // [batch_size, context_len, dim]
+    torch::Tensor &V,       // [batch_size, context_len, dim]
+    torch::Tensor &mask,    // [batch_size, context_len, context_len]
     int num_heads
 ) {
-    CHECK_INPUT(Q); CHECK_INPUT(K); CHECK_INPUT(V);
+    CHECK_INPUT(Q); CHECK_INPUT(K); CHECK_INPUT(V); CHECK_INPUT(mask);
     auto batch_size = Q.size(0);
     auto context_len = Q.size(1);
     auto dim = Q.size(2);
@@ -153,6 +158,7 @@ std::vector<torch::Tensor> naive_attention_forward(
                 Q.data_ptr<scalar_t>(),
                 K.data_ptr<scalar_t>(),
                 V.data_ptr<scalar_t>(),
+                mask.data_ptr<scalar_t>(),
                 S.data_ptr<scalar_t>(),
                 P.data_ptr<scalar_t>(),
                 O.data_ptr<scalar_t>()
