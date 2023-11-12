@@ -6,21 +6,24 @@ from attention import naive_attention_forward
 
 std = 0.1
 
-batch_size = 8
+batch_size = 4
 context_size = 2048
-dim = 32
+dim = 64
 num_heads = 4
 
-Q = torch.normal(mean=0, std=std,size=(batch_size, context_size, dim)).cuda()
-K = torch.normal(mean=0, std=std,size=(batch_size, context_size, dim)).cuda()
-V = torch.normal(mean=0, std=std,size=(batch_size, context_size, dim)).cuda()
+Q = torch.normal(mean=0, std=std,size=(batch_size, context_size, dim)).cuda().to(torch.float32)
+K = torch.normal(mean=0, std=std,size=(batch_size, context_size, dim)).cuda().to(torch.float32)
+V = torch.normal(mean=0, std=std,size=(batch_size, context_size, dim)).cuda().to(torch.float32)
 mask = torch.from_numpy(np.tril(np.ones(context_size).astype(np.float32))).reshape(1, context_size, context_size).repeat(batch_size, 1, 1).cuda()
 
 def reference_MHA(Q, K, V, mask=None):
+
     _Q = Q.reshape(batch_size, context_size, num_heads, dim // num_heads).permute(0, 2, 1, 3).reshape(batch_size * num_heads, context_size, dim // num_heads)
     _K = K.reshape(batch_size, context_size, num_heads, dim // num_heads).permute(0, 2, 1, 3).reshape(batch_size * num_heads, context_size, dim // num_heads)
-
+    scale = (dim / num_heads) ** -0.5
     S = torch.bmm(_Q, _K.permute(0, 2, 1)).reshape(batch_size, num_heads, context_size, context_size)
+    S *= scale
+    print(scale)
     if mask is not None:
         S += (mask.unsqueeze(1) - 1) * 100000.0
     P = S.softmax(dim=-1)
