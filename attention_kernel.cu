@@ -49,6 +49,7 @@ template <typename scalar_t>
 __global__ void naive_attention_forward_kernel(
     const int context_len,
     const int dim,
+    const float scale,
     scalar_t* __restrict__ Q,
     scalar_t* __restrict__ K,
     scalar_t* __restrict__ V,
@@ -81,7 +82,7 @@ __global__ void naive_attention_forward_kernel(
                     int K_idx = (context_len * num_heads * dim) * batch_id + \
                                 (dim) * head_id + \
                                 (num_heads * dim) * j + k;
-                    S[S_idx] += Q[Q_idx] * K[K_idx];
+                    S[S_idx] += (Q[Q_idx] * K[K_idx]) / scale;
                 }
             } else {
                 S[S_idx] = -100000.0;
@@ -132,7 +133,8 @@ std::vector<torch::Tensor> naive_attention_forward(
     torch::Tensor &K,       // [batch_size, context_len, dim]
     torch::Tensor &V,       // [batch_size, context_len, dim]
     torch::Tensor &mask,    // [batch_size, context_len, context_len]
-    int num_heads
+    int num_heads,
+    float scale
 ) {
     CHECK_INPUT(Q); CHECK_INPUT(K); CHECK_INPUT(V); CHECK_INPUT(mask);
     auto batch_size = Q.size(0);
@@ -155,6 +157,7 @@ std::vector<torch::Tensor> naive_attention_forward(
             naive_attention_forward_kernel<<<blocks, threads, context_len, stream>>>(
                 context_len,
                 dim / num_heads,
+                scale,
                 Q.data_ptr<scalar_t>(),
                 K.data_ptr<scalar_t>(),
                 V.data_ptr<scalar_t>(),
@@ -167,6 +170,7 @@ std::vector<torch::Tensor> naive_attention_forward(
     );
     return {S, P, O};
 }
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("naive_attention_forward", &naive_attention_forward, "forward");
 }
