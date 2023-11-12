@@ -8,6 +8,8 @@
 #include <iostream>
 #include <algorithm>
 #include <vector>
+#include <cmath>
+
 
 #define CHECK_CUDA(x) AT_ASSERTM(x.type().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) AT_ASSERTM(x.is_contiguous(), #x " must be contiguous")
@@ -133,8 +135,7 @@ std::vector<torch::Tensor> naive_attention_forward(
     torch::Tensor &K,       // [batch_size, context_len, dim]
     torch::Tensor &V,       // [batch_size, context_len, dim]
     torch::Tensor &mask,    // [batch_size, context_len, context_len]
-    int num_heads,
-    float scale
+    int num_heads
 ) {
     CHECK_INPUT(Q); CHECK_INPUT(K); CHECK_INPUT(V); CHECK_INPUT(mask);
     auto batch_size = Q.size(0);
@@ -149,6 +150,8 @@ std::vector<torch::Tensor> naive_attention_forward(
     const int threads = std::min((int)context_len, 1024);
     const dim3 blocks(batch_size, num_heads);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    float scale = 1.0 / std::sqrt(float(dim) / num_heads);
 
     AT_DISPATCH_FLOATING_TYPES(
         Q.scalar_type(),
