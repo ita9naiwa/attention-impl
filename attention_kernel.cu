@@ -60,7 +60,6 @@ __global__ void naive_attention_forward_kernel(
     scalar_t* __restrict__ P,
     scalar_t* __restrict__ O
 ) {
-    extern __shared__ float S_softmax[];
     const int thread_id     = threadIdx.x;
     const int block_dim     = blockDim.x;
     const int batch_id      = blockIdx.x;
@@ -84,7 +83,7 @@ __global__ void naive_attention_forward_kernel(
                     int K_idx = (context_len * num_heads * dim) * batch_id + \
                                 (dim) * head_id + \
                                 (num_heads * dim) * j + k;
-                    S[S_idx] += (Q[Q_idx] * K[K_idx]) * scale;
+                    S[S_idx] += (scalar_t)((Q[Q_idx] * K[K_idx]) * scale);
                 }
             } else {
                 S[S_idx] = -100000.0;
@@ -105,7 +104,7 @@ __global__ void naive_attention_forward_kernel(
         val_sum = blockReduceSum<float>(val_sum);
         for(int j = thread_id; j < context_len; j += block_dim) {
             float exp_val = exp(S[idx_beg + context_len * i + j]);
-            P[idx_beg + context_len * i + j] = exp_val / val_sum;
+            P[idx_beg + context_len * i + j] = (scalar_t)(exp_val / val_sum);
         }
     }
     // O has shape [batch_size, context_len, num_heads, dim]
@@ -232,10 +231,10 @@ std::vector<torch::Tensor> naive_attention_forward(
     auto context_len = Q.size(1);
     auto dim = Q.size(2);
     assert(dim % num_heads == 0);
-    torch::Device device(torch::kCUDA);
+    auto options = torch::TensorOptions().dtype(Q.scalar_type()).device(torch::kCUDA);
 
-    auto S = torch::zeros({batch_size, num_heads, context_len, context_len}, device);
-    auto P = torch::zeros({batch_size, num_heads, context_len, context_len}, device);
+    auto S = torch::zeros({batch_size, num_heads, context_len, context_len}, options);
+    auto P = torch::zeros({batch_size, num_heads, context_len, context_len}, options);
     auto O = torch::zeros_like(Q);
     const int threads = std::min((int)context_len, 1024);
     const dim3 blocks(batch_size, num_heads);
@@ -243,7 +242,7 @@ std::vector<torch::Tensor> naive_attention_forward(
 
     float scale = 1.0 / std::sqrt(float(dim) / num_heads);
 
-    AT_DISPATCH_FLOATING_TYPES(
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
         Q.scalar_type(),
         "naive_attention_forward_kernel",
         ([&] {
@@ -280,11 +279,11 @@ std::vector<torch::Tensor> kv_attention_forward(
     auto context_len = K_cache.size(1);
     assert(dim % num_heads == 0);
 
-    torch::Device device(torch::kCUDA);
+    auto options = torch::TensorOptions().dtype(Q.scalar_type()).device(torch::kCUDA);
 
-    auto S = torch::zeros({batch_size, num_heads, context_len + 1}, device);
-    auto P = torch::zeros({batch_size, num_heads, context_len + 1}, device);
-    auto O = torch::zeros({batch_size, dim}, device);
+    auto S = torch::zeros({batch_size, num_heads, context_len + 1}, options);
+    auto P = torch::zeros({batch_size, num_heads, context_len + 1}, options);
+    auto O = torch::zeros({batch_size, dim}, options);
 
     const int threads = std::min((int) (context_len + 1), 1024);
     const dim3 blocks(batch_size, num_heads);
@@ -292,7 +291,7 @@ std::vector<torch::Tensor> kv_attention_forward(
 
     float scale = 1.0 / std::sqrt(float(dim) / num_heads);
 
-    AT_DISPATCH_FLOATING_TYPES(
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
         Q.scalar_type(),
         "kv_attention_forward_kernel",
         ([&] {
