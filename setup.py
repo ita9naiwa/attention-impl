@@ -7,6 +7,10 @@ setup(
         CUDAExtension('attention', [
             'attention_kernel.cu',
         ]),
+        CUDAExtension('paged_attention', [
+            'paged_attention_kernel.cu',
+        ]),
+
     ],
     cmdclass={
         'build_ext': BuildExtension
