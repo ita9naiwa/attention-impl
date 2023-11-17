@@ -10,7 +10,7 @@ torch.manual_seed(42)
 std = 0.1
 batch_size = 2
 dim = 4
-num_heads = 1
+num_heads = 2
 cache_size = 1024
 Q = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
 K = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
@@ -54,8 +54,6 @@ S2, P2, O2 = paged_kv_attention_forward(Q, K, V, K_cache, V_cache, cache_indices
 end = time.perf_counter()
 print(f"CUDA MHA implementation: {end - beg:0.4f} secs")
 
-print(S1)
-print(S2)
 print("======(Max diff) Accuracy compared to ref implementation======")
 print(torch.abs(S1 - S2).max())
 print(torch.abs(P1 - P2).max())

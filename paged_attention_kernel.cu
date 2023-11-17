@@ -116,7 +116,6 @@ __global__ void paged_kv_attention_forward_kernel(
     const int size = end_idx - beg_idx;
 
      // S[i] = K_cache[i][j] * Q[j];
-    printf("block_id %d beg_id %d size %d\n",block_id, beg_idx, size);
     for(int i = thread_id; i < size; i += block_dim) {
         int S_idx = ((1 + max_context_len) * num_heads) * block_id + \
                     (1 + max_context_len) * head_id + i;
