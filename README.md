@@ -2,6 +2,11 @@
 
 For study purpose
 
+implemented attentions
+- Naive Attention
+- Attention with KV
+- Attention with non-contagious memory
+- Attention with non-contagious KV cache (PagedAttention with block size 1)
 
 ### comparison with MHA implementation
 
@@ -16,7 +21,6 @@ def reference_MHA(Q, K, V):
     O = torch.matmul(P, V.reshape(batch_size, context_size, num_heads, dim // num_heads).permute(0, 2, 1, 3))
     O = O.permute(0, 2, 1, 3).reshape(batch_size, context_size, dim)
     return S, P, O
-
 ...
 
 beg = time.perf_counter()

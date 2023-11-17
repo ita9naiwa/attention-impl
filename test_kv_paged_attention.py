@@ -53,7 +53,6 @@ beg = time.perf_counter()
 S2, P2, O2 = paged_kv_attention_forward(Q, K, V, K_cache, V_cache, cache_indices, offsets, num_heads)
 end = time.perf_counter()
 print(f"CUDA MHA implementation: {end - beg:0.4f} secs")
-
 print("======(Max diff) Accuracy compared to ref implementation======")
 print(torch.abs(S1 - S2).max())
 print(torch.abs(P1 - P2).max())
