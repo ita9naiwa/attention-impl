@@ -7,18 +7,18 @@ from paged_attention import paged_kv_attention_forward
 np.random.seed(42)
 torch.manual_seed(42)
 
-std = 0.1
+std = 1.0
 batch_size = 2
-dim = 4
-num_heads = 2
+dim = 768
+num_heads = 12
 cache_size = 1024
 Q = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
 K = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
 V = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
 K_cache = torch.normal(mean=0, std=std, size=(cache_size, dim)).cuda().to(torch.float32)
 V_cache = torch.normal(mean=0, std=std, size=(cache_size, dim)).cuda().to(torch.float32)
-cache_indices = torch.LongTensor([16, 24, 1, 2]).to(torch.int32).cuda()
-offsets = torch.LongTensor([2, 4]).to(torch.int32).cuda()
+cache_indices = torch.LongTensor([16, 24, 36, 1, 2, 512]).to(torch.int32).cuda()
+offsets = torch.LongTensor([3, 6]).to(torch.int32).cuda()
 
 def reference_kv_MHA(Q, K, V, K_cache, V_cache, cache_indices):
     scale = (dim / num_heads) ** -0.5
@@ -27,8 +27,8 @@ def reference_kv_MHA(Q, K, V, K_cache, V_cache, cache_indices):
     V = V.reshape(batch_size, num_heads, dim // num_heads)
     K_cache = K_cache[cache_indices, :]
     V_cache = V_cache[cache_indices, :]
-    K_cache = K_cache.reshape(batch_size, 2, num_heads, dim // num_heads).permute(0, 2, 1, 3)
-    V_cache = V_cache.reshape(batch_size, 2, num_heads, dim // num_heads).permute(0, 2, 1, 3)
+    K_cache = K_cache.reshape(batch_size, 3, num_heads, dim // num_heads).permute(0, 2, 1, 3)
+    V_cache = V_cache.reshape(batch_size, 3, num_heads, dim // num_heads).permute(0, 2, 1, 3)
     new_K = torch.concat([K_cache, K.unsqueeze(2)], dim=2)
     new_V = torch.concat([V_cache, V.unsqueeze(2)], dim=2)
     S = torch.matmul(

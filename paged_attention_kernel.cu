@@ -36,6 +36,7 @@ __global__ void paged_attention_forward_kernel(
     const int end_idx = offsets[block_id];
     const int size = end_idx - beg_idx;
     // S, P have shape [batch_size, num_heads, max_context_len, max_context_len]
+    // Q, K have shape [length, num_heads, dim]
     for(int i = thread_id; i < size; i += block_dim) {
         const int shifted_i = i + beg_idx;
         for(int j = 0; j < size; ++j) {
@@ -56,25 +57,33 @@ __global__ void paged_attention_forward_kernel(
         }
     }
     float val_sum;
+    float val_max;
     const int idx_beg = (num_heads * max_context_len * max_context_len) * block_id + \
                         (max_context_len * max_context_len) * head_id;
     // batch_size, num_heads, max_context_len, max_context_len
-    for (int i = 0; i < max_context_len; ++i) {
+    for (int i = 0; i < size; ++i) {
+        val_max = 0;
         val_sum = 1e-9;
         for(int j = thread_id; j < size; j += block_dim) {
-            float exp_val = exp(S[idx_beg + max_context_len * i + j]);
+            float val = S[idx_beg + max_context_len * i + j];
+            val_max = max(val, val_max);
+        }
+        val_max = blockReduceMax<float>(val_max);
+
+        for(int j = thread_id; j < size; j += block_dim) {
+            float exp_val = exp(S[idx_beg + max_context_len * i + j] - val_max);
             val_sum += exp_val;
         }
         __syncthreads();
         val_sum = blockReduceSum<float>(val_sum);
         for(int j = thread_id; j < size; j += block_dim) {
-            float exp_val = exp(S[idx_beg + max_context_len * i + j]);
-            P[idx_beg + max_context_len * i + j] = (scalar_t)(exp_val / val_sum);
+            float exp_val = exp(S[idx_beg + max_context_len * i + j] - val_max);
+            P[idx_beg + max_context_len * i + j] = (exp_val / val_sum);
         }
     }
-    for(int i = thread_id; i < max_context_len; i += block_dim) {
+    for(int i = thread_id; i < size; i += block_dim) {
         const int shifted_i = beg_idx + i;
-        for(int j = 0; j < max_context_len; ++j) {
+        for(int j = 0; j < size; ++j) {
             const int shifted_j = beg_idx + j;
             for(int k = 0; k < dim; ++k) {
                 int P_idx = (num_heads * max_context_len * max_context_len) * block_id + \
@@ -100,8 +109,8 @@ __global__ void paged_kv_attention_forward_kernel(
     scalar_t* __restrict__ V_cache,         // [cache_size, num_heads, dim]
     int* __restrict__ cache_indices,        // [length]
     int* __restrict__ offsets,              // [batch_size]
-    scalar_t* __restrict__ S,               // [batch_size, num_heads, max_context_len + 1]
-    scalar_t* __restrict__ P,               // [batch_size, num_heads, max_context_len + 1]
+    double* __restrict__ S,               // [batch_size, num_heads, max_context_len + 1]
+    double* __restrict__ P,               // [batch_size, num_heads, max_context_len + 1]
     scalar_t* __restrict__ O                // [length, num_heads, dim]
 ) {
     const int thread_id = threadIdx.x;
@@ -111,46 +120,52 @@ __global__ void paged_kv_attention_forward_kernel(
     const int batch_size = gridDim.x;
     const int num_heads = gridDim.y;
 
-    const int beg_idx = (block_id == 0)? 0 : offsets[block_id - 1];
+    const int beg_idx = (block_id == 0) ? 0 : offsets[block_id - 1];
     const int end_idx = offsets[block_id];
     const int size = end_idx - beg_idx;
-
-     // S[i] = K_cache[i][j] * Q[j];
+    // S[i] = K_cache[i][j] * Q[j];
+    // S has shape [batch_size, num_heads, max_context_len + 1]
     for(int i = thread_id; i < size; i += block_dim) {
         int S_idx = ((1 + max_context_len) * num_heads) * block_id + \
                     (1 + max_context_len) * head_id + i;
         for(int j = 0;j < dim; ++j) {
             int K_cache_idx = (dim) * head_id + (num_heads * dim) * cache_indices[beg_idx + i] + j;
             int Q_idx = (num_heads * dim) * block_id + dim * head_id + j;
-            S[S_idx] += K_cache[K_cache_idx] * Q[Q_idx];
+            S[S_idx] += K_cache[K_cache_idx] * Q[Q_idx] * scale;
         }
     }
-    __syncthreads();
-    scalar_t tmp = 0.0;
+    double tmp = 0.0;
     for(int i = thread_id; i < dim; i += block_dim) {
         int Q_idx = (num_heads * dim) * block_id + dim * head_id + i;
         int K_idx = Q_idx;
-        tmp += Q[Q_idx] * K[K_idx];
+        tmp += (double)Q[Q_idx] * (double)K[K_idx] * scale;
     }
 
     // S shape [batch_size, num_heads, max_context_len + 1]
-    S[(num_heads * (1 + max_context_len)) * block_id + (max_context_len + 1) * head_id + size] = blockReduceSum<float>(tmp);
+    __syncthreads();
+    S[(num_heads * (1 + max_context_len)) * block_id + (max_context_len + 1) * head_id + size] = blockReduceSum<double>(tmp);
 
-
-    float exp_sum = 0;
+    double val_max = 0;
     for(int i = thread_id; i < size + 1; i += block_dim) {
         int idx = ((1 + max_context_len) * num_heads) * block_id + (1 + max_context_len) * head_id + i;
-        float exp_val = exp(S[idx]);
+        val_max = max(val_max, S[idx]);
+    }
+    __syncthreads();
+    val_max = blockReduceMax<double>(val_max);
+    double exp_sum = 1e-6;
+    for(int i = thread_id; i < size + 1; i += block_dim) {
+        int idx = ((1 + max_context_len) * num_heads) * block_id + (1 + max_context_len) * head_id + i;
+        double exp_val = exp(S[idx] - val_max);
         exp_sum += exp_val;
     }
-
-    exp_sum = blockReduceSum<float>(exp_sum);
+    __syncthreads();
+    exp_sum = blockReduceSum<double>(exp_sum);
     for(int i = thread_id; i < size + 1; i += block_dim) {
         int idx = ((1 + max_context_len) * num_heads) * block_id + (1 + max_context_len) * head_id + i;
-        float exp_val = exp(S[idx]);
-        P[idx] = exp_val / exp_sum;
+        double exp_val = exp(S[idx] - val_max);
+        P[idx] = exp_val / (1e-6 + exp_sum);
     }
-
+    __syncthreads();
     for (int j = thread_id; j < dim; j += block_dim) {
         for (int i = 0; i < size; ++i) {
             int O_idx = (num_heads * dim) * block_id + (dim) * head_id + j;
@@ -160,6 +175,7 @@ __global__ void paged_kv_attention_forward_kernel(
             O[O_idx] += P[P_idx] * V_cache[V_idx];
         }
     }
+
     for (int j = thread_id; j < dim; j += block_dim) {
         int O_idx = (num_heads * dim) * block_id + (dim) * head_id + j;
         int P_idx = (num_heads * (1 + max_context_len)) * block_id + \
@@ -235,15 +251,15 @@ std::vector<torch::Tensor> paged_kv_attention_forward(
     auto dim = Q.size(1);
     assert(dim % num_heads == 0);
 
+    auto options_for_S = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCUDA);
     auto options = torch::TensorOptions().dtype(Q.scalar_type()).device(torch::kCUDA);
-
     auto max_context_len = offsets[0].item<int>();
     for(int i = 1; i < batch_size; ++i) {
         max_context_len = max(max_context_len, (offsets[i] - offsets[i - 1]).item<int>());
     }
 
-    auto S = torch::zeros({batch_size, num_heads, max_context_len + 1}, options);
-    auto P = torch::zeros({batch_size, num_heads, max_context_len + 1}, options);
+    auto S = torch::zeros({batch_size, num_heads, max_context_len + 1}, options_for_S);
+    auto P = torch::zeros({batch_size, num_heads, max_context_len + 1}, options_for_S);
     auto O = torch::zeros_like(Q);
 
     const int threads = std::min((int) (max_context_len + 1), 1024);
@@ -267,8 +283,8 @@ std::vector<torch::Tensor> paged_kv_attention_forward(
                 V_cache.data_ptr<scalar_t>(),
                 cache_indices.data_ptr<int>(),
                 offsets.data_ptr<int>(),
-                S.data_ptr<scalar_t>(),
-                P.data_ptr<scalar_t>(),
+                S.data_ptr<double>(),
+                P.data_ptr<double>(),
                 O.data_ptr<scalar_t>()
             );
         })

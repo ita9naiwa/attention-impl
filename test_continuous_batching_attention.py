@@ -6,8 +6,8 @@ from paged_attention import paged_attention_forward
 
 std = 0.1
 
-dim = 4
-num_heads = 2
+dim = 768
+num_heads = 4
 offsets = torch.Tensor([3, 6, 9]).to(torch.int32).cuda()
 Q = torch.normal(mean=0, std=std,size=(9, dim)).cuda().to(torch.float16)
 K = torch.normal(mean=0, std=std,size=(9, dim)).cuda().to(torch.float16)
@@ -37,7 +37,7 @@ def reference_MHA(Q, K, V, mask=None):
     return S, P, O
 
 S1, P1, O1 = reference_MHA(Q, K, V, mask=mask)
-
+print(O1)
 print(O1, O2)
 print(torch.abs(S1 - S2).max())
 print(torch.abs(P1 - P2).max())
