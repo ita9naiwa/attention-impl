@@ -1,4 +1,4 @@
-## CUDA naive multi head attention implementation
+## CUDA multi head attention implementation
 
 For study purpose
 
