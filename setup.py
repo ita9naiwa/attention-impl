@@ -10,6 +10,9 @@ setup(
         CUDAExtension('paged_attention', [
             'paged_attention_kernel.cu',
         ]),
+        CUDAExtension('rotary_embedding', [
+            'rotary_embedding.cu',
+        ]),
 
     ],
     cmdclass={
