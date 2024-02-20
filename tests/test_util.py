@@ -13,6 +13,18 @@ def get_qkv(batch_size=4, context_size=2048, dim=64, std=1, dtype=torch.float16,
         mask = mask.cuda()
     return Q, K, V, mask
 
+
+def get_packed_qkv(batch_size, dim, dtype, to_cuda=False, std=0.1):
+    Q = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
+    K = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
+    V = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
+    if to_cuda:
+        Q = Q.cuda()
+        K = K.cuda()
+        V = V.cuda()
+    return Q, K, V
+
+
 def get_kv_cache(batch_size=512, context_size=32, dim=64, dtype=torch.float16, to_cuda=False):
     K_cache = torch.zeros(size=(batch_size, context_size, dim), dtype=dtype)
     V_cache = torch.zeros(size=(batch_size, context_size, dim), dtype=dtype)

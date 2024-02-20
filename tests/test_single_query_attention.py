@@ -1,9 +1,9 @@
 import torch
 import numpy as np
 import time
-from attention import kv_attention_forward
+from lm_ops import single_query_attention
 
-from test_util import get_qkv, get_kv_cache
+from test_util import get_packed_qkv, get_kv_cache
 import pytest
 
 def reference_kv_MHA(Q, K, V, K_cache, V_cache, num_heads=1):
@@ -38,16 +38,14 @@ def reference_kv_MHA(Q, K, V, K_cache, V_cache, num_heads=1):
 @pytest.mark.parametrize("num_heads", [1, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_kv_attention(batch_size, context_size, dim, num_heads, dtype):
-    std = 0.1
-    Q = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
-    K = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
-    V = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
+    Q, K, V = get_packed_qkv(batch_size=batch_size, dim=dim, dtype=dtype, to_cuda=True)
     K_cache, V_cache = get_kv_cache(batch_size=batch_size,
                                     context_size=context_size,
                                     dim=dim, dtype=dtype, to_cuda=True)
     S1, P1, O1 = reference_kv_MHA(Q, K, V, K_cache, V_cache)
-    S2, P2, O2 = kv_attention_forward(Q, K, V, K_cache, V_cache, num_heads)
+    S2, P2, O2 = single_query_attention(Q, K, V, K_cache, V_cache, num_heads)
     torch.allclose(O1, O2, atol=1e-2)
 
+
 if __name__ == "__main__":
-    test_kv_attention(32, 1024, 64, 8)
+    test_kv_attention(32, 1024, 64, 8, torch.float16)

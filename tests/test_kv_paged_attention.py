@@ -1,34 +1,32 @@
 import torch
 import numpy as np
 import time
-from paged_attention import paged_kv_attention_forward
+from lm_ops import paged_kv_attention_forward
 
+import pytest
 
-np.random.seed(42)
-torch.manual_seed(42)
-
-std = 1.0
+std = 0.1
 batch_size = 2
-dim = 768
-num_heads = 12
+dim = 4
+num_heads = 2
 cache_size = 1024
 Q = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
 K = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
 V = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
 K_cache = torch.normal(mean=0, std=std, size=(cache_size, dim)).cuda().to(torch.float32)
 V_cache = torch.normal(mean=0, std=std, size=(cache_size, dim)).cuda().to(torch.float32)
-cache_indices = torch.LongTensor([16, 24, 36, 1, 2, 512]).to(torch.int32).cuda()
-offsets = torch.LongTensor([3, 6]).to(torch.int32).cuda()
+cache_indices = torch.LongTensor([16, 24, 1, 2]).to(torch.int32).cuda()
+offsets = torch.LongTensor([2, 4]).to(torch.int32).cuda()
 
-def reference_kv_MHA(Q, K, V, K_cache, V_cache, cache_indices):
+def reference_paged_kv_single_query_attention(Q, K, V, K_cache, V_cache, cache_indices):
     scale = (dim / num_heads) ** -0.5
     Q = Q.reshape(batch_size, num_heads, dim // num_heads)
     K = K.reshape(batch_size, num_heads, dim // num_heads)
     V = V.reshape(batch_size, num_heads, dim // num_heads)
     K_cache = K_cache[cache_indices, :]
     V_cache = V_cache[cache_indices, :]
-    K_cache = K_cache.reshape(batch_size, 3, num_heads, dim // num_heads).permute(0, 2, 1, 3)
-    V_cache = V_cache.reshape(batch_size, 3, num_heads, dim // num_heads).permute(0, 2, 1, 3)
+    K_cache = K_cache.reshape(batch_size, 2, num_heads, dim // num_heads).permute(0, 2, 1, 3)
+    V_cache = V_cache.reshape(batch_size, 2, num_heads, dim // num_heads).permute(0, 2, 1, 3)
     new_K = torch.concat([K_cache, K.unsqueeze(2)], dim=2)
     new_V = torch.concat([V_cache, V.unsqueeze(2)], dim=2)
     S = torch.matmul(
@@ -46,7 +44,7 @@ def reference_kv_MHA(Q, K, V, K_cache, V_cache, cache_indices):
 
 
 beg = time.perf_counter()
-S1, P1, O1 = reference_kv_MHA(Q, K, V, K_cache, V_cache, cache_indices)
+S1, P1, O1 = reference_paged_kv_single_query_attention(Q, K, V, K_cache, V_cache, cache_indices)
 end = time.perf_counter()
 print(f"reference MHA implementation: {end - beg:0.4f} secs")
 beg = time.perf_counter()

@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 import numpy as np
-from rotary_embedding import rotary_embedding_inplace
+from lm_ops import rotary_embedding_inplace
 
 import pytest
 

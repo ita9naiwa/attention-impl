@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import time
 
-from attention import naive_attention_forward
+from lm_ops import naive_attention_forward
 
 from test_util import get_qkv
 
