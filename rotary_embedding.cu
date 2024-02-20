@@ -24,8 +24,8 @@ __global__ void rotary_embedding_inplace_kernel(
     const int d = threadIdx.x;
     const int rot_dim = rot_half * 2;
     const int pos = positions[idx];
-    const scalar_t c = cos[pos * rot_half + (d % rot_half)];
-    const scalar_t s = sin[pos * rot_half + (d % rot_half)];
+    const scalar_t c = __ldg(cos + (pos * rot_half + (d % rot_half)));
+    const scalar_t s = __ldg(sin + (pos * rot_half + (d % rot_half)));
 
     const int i = idx * num_heads * head_dim + h * head_dim;
     // I think this opeartion doesn't make branch divergence
