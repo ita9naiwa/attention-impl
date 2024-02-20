@@ -3,19 +3,12 @@ import numpy as np
 import time
 from attention import kv_attention_forward
 
-std = 0.1
-batch_size = 32
-context_size = 32
-dim = 768
-num_heads = 4
+from test_util import get_qkv, get_kv_cache
+import pytest
 
-Q = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
-K = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
-V = torch.normal(mean=0, std=std, size=(batch_size, dim)).cuda().to(torch.float32)
-K_cache = torch.normal(mean=0, std=std, size=(batch_size, context_size, dim)).cuda().to(torch.float32)
-V_cache = torch.normal(mean=0, std=std, size=(batch_size, context_size, dim)).cuda().to(torch.float32)
-
-def reference_kv_MHA(Q, K, V, K_cache, V_cache):
+def reference_kv_MHA(Q, K, V, K_cache, V_cache, num_heads=1):
+    batch_size, dim = Q.shape
+    batch_size, context_size, dim = K_cache.shape
     scale = (dim / num_heads) ** -0.5
     Q = Q.reshape(batch_size, num_heads, dim // num_heads)
     K = K.reshape(batch_size, num_heads, dim // num_heads)
@@ -39,16 +32,22 @@ def reference_kv_MHA(Q, K, V, K_cache, V_cache):
     return S, P, O
 
 
-beg = time.perf_counter()
-S1, P1, O1 = reference_kv_MHA(Q, K, V, K_cache, V_cache)
-end = time.perf_counter()
-print(f"reference MHA implementation: {end - beg:0.4f} secs")
-beg = time.perf_counter()
-S2, P2, O2 = kv_attention_forward(Q, K, V, K_cache, V_cache, num_heads)
-end = time.perf_counter()
-print(f"CUDA MHA implementation: {end - beg:0.4f} secs")
+@pytest.mark.parametrize("batch_size", [1, 4, 8])
+@pytest.mark.parametrize("context_size", [256, 512])
+@pytest.mark.parametrize("dim", [32, 64, 256])
+@pytest.mark.parametrize("num_heads", [1, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_kv_attention(batch_size, context_size, dim, num_heads, dtype):
+    std = 0.1
+    Q = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
+    K = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
+    V = torch.normal(mean=0, std=std, size=(batch_size, dim), dtype=dtype).cuda()
+    K_cache, V_cache = get_kv_cache(batch_size=batch_size,
+                                    context_size=context_size,
+                                    dim=dim, dtype=dtype, to_cuda=True)
+    S1, P1, O1 = reference_kv_MHA(Q, K, V, K_cache, V_cache)
+    S2, P2, O2 = kv_attention_forward(Q, K, V, K_cache, V_cache, num_heads)
+    torch.allclose(O1, O2, atol=1e-2)
 
-print("======(Max diff) Accuracy compared to ref implementation======")
-print(torch.abs(S1 - S2).max())
-print(torch.abs(P1 - P2).max())
-print(torch.abs(O1 - O2).max())
+if __name__ == "__main__":
+    test_kv_attention(32, 1024, 64, 8)

@@ -1,11 +1,9 @@
 import torch
 from torch import nn
 import numpy as np
-import time
 from rotary_embedding import rotary_embedding_inplace
 
-
-
+import pytest
 
 class RefRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -49,7 +47,6 @@ class RefRotaryEmbedding(nn.Module):
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
-
 class MyRotaryEmbedding(nn.Module):
     def __init__(self, head_dim, rot_dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
@@ -78,11 +75,11 @@ class MyRotaryEmbedding(nn.Module):
                                  self.head_dim)
         return q, k
 
-if __name__ == "__main__":
-    print("when rot_dim is equal to head_dim")
+
+@pytest.mark.parametrize("num_heads,head_dim", [(1, 16), (4, 32), (8, 64)])
+def test_rot_dim_equal_to_head_dim(num_heads, head_dim):
     num_heads = 1
-    head_dim = 16
-    rot_dim = 16
+    rot_dim = head_dim
     max_position_embeddings = 32
     input_size = 4
     q1 = torch.normal(mean=0, std=0.1, size=(input_size, num_heads, head_dim)).cuda().to(torch.float16)
@@ -104,14 +101,13 @@ if __name__ == "__main__":
     q2, k2 = my_rotary_emb.forward(q2, k2, positions)
     q1 = q1.reshape(input_size, -1)
     k1 = k1.reshape(input_size, -1)
-    print("======(Max diff) Accuracy compared to ref implementation======")
-    print((q1 - q2).abs().sum())
+    q1 = q1.cpu().to(torch.float32).numpy()
+    q2 = q2.cpu().to(torch.float32).numpy()
+    assert np.allclose(q1, q2, atol=1e-3)
 
-
+@pytest.mark.parametrize("num_heads,head_dim,rot_dim", [(1, 16, 8), (4, 32, 4), (8, 64, 32)])
+def test_rot_dim_neq_head_dim(num_heads, head_dim, rot_dim):
     print("when rot_dim != head_dim")
-    num_heads = 1
-    head_dim = 32
-    rot_dim = 16
     max_position_embeddings = 32
     input_size = 4
     q1 = torch.normal(mean=0, std=0.1, size=(input_size, num_heads, head_dim)).cuda().to(torch.float16)
@@ -141,5 +137,6 @@ if __name__ == "__main__":
     q2, k2 = my_rotary_emb.forward(q2, k2, positions)
     q1 = q1.reshape(input_size, -1)
     k1 = k1.reshape(input_size, -1)
-    print("======(Max diff) Accuracy compared to ref implementation======")
-    print((q1 - q2).abs().sum())
+    q1 = q1.cpu().to(torch.float32).numpy()
+    q2 = q2.cpu().to(torch.float32).numpy()
+    assert np.allclose(q1, q2, atol=1e-3)
