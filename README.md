@@ -6,5 +6,6 @@ implemented attentions
 - Naive Attention
 - Attention with KV
 - Attention with non-contagious memory
-- Attention with non-contagious KV cache (PagedAttention with block size 1)
+- Single Query Attention with non-contagious KV cache (PagedAttention with block size 1)
+- Multi Query Attention with non-contagious KV cache (for Speculative Decoding)
 - Rotary Embedding
