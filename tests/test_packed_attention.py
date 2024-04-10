@@ -43,6 +43,6 @@ def test_packed_embedding_with_same_seq_len(batch_size, context_size, dim, num_h
     assert torch.allclose(O1, O2, atol=2 * 1e-2)
 
 
-def test_packed_embedding_with_different_seq_len(batch_size, context_size, dim, num_heads, dtype):
-    offsets = torch.IntTensor([(1 + i) * context_size for i in range(batch_size)]).cuda()
-    raise NotImplementedError
+# def test_packed_embedding_with_different_seq_len(batch_size, context_size, dim, num_heads, dtype):
+#     offsets = torch.IntTensor([(1 + i) * context_size for i in range(batch_size)]).cuda()
+#     raise NotImplementedError

@@ -75,10 +75,3 @@ void rotary_embedding_inplace(
         })
     );
 }
-
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("rotary_embedding_inplace",
-          &rotary_embedding_inplace,
-          "rotary_embedding_inplace");
-}

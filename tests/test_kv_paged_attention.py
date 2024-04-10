@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import time
-from lm_ops import paged_kv_attention_forward
+from lm_ops import kv_single_query_attention
 
 import pytest
 
@@ -48,7 +48,7 @@ S1, P1, O1 = reference_paged_kv_single_query_attention(Q, K, V, K_cache, V_cache
 end = time.perf_counter()
 print(f"reference MHA implementation: {end - beg:0.4f} secs")
 beg = time.perf_counter()
-S2, P2, O2 = paged_kv_attention_forward(Q, K, V, K_cache, V_cache, cache_indices, offsets, num_heads)
+S2, P2, O2 = kv_single_query_attention(Q, K, V, K_cache, V_cache, cache_indices, offsets, num_heads)
 end = time.perf_counter()
 print(f"CUDA MHA implementation: {end - beg:0.4f} secs")
 print("======(Max diff) Accuracy compared to ref implementation======")

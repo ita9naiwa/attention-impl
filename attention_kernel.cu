@@ -10,10 +10,11 @@
 #include <vector>
 #include <cmath>
 
+#include "ops.h"
 #include "util.cuh"
 
 template <typename scalar_t>
-__global__ void naive_attention_forward_kernel(
+__global__ void naive_attention_kernel(
     const int context_len,
     const int dim,
     const float scale,
@@ -94,7 +95,7 @@ __global__ void naive_attention_forward_kernel(
 }
 
 template <typename scalar_t>
-__global__ void kv_attention_forward_kernel(
+__global__ void single_query_attention_kernel(
     const int context_len,
     const int dim,
     const float scale,
@@ -184,7 +185,7 @@ __global__ void kv_attention_forward_kernel(
     }
 }
 
-std::vector<torch::Tensor> naive_attention_forward(
+std::vector<torch::Tensor> naive_attention(
     torch::Tensor &Q,       // [batch_size, context_len, dim]
     torch::Tensor &K,       // [batch_size, context_len, dim]
     torch::Tensor &V,       // [batch_size, context_len, dim]
@@ -209,9 +210,9 @@ std::vector<torch::Tensor> naive_attention_forward(
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
         Q.scalar_type(),
-        "naive_attention_forward_kernel",
+        "naive_attention_kernel",
         ([&] {
-            naive_attention_forward_kernel<<<blocks, threads, context_len, stream>>>(
+            naive_attention_kernel<<<blocks, threads, context_len, stream>>>(
                 context_len,
                 dim / num_heads,
                 scale,
@@ -228,7 +229,7 @@ std::vector<torch::Tensor> naive_attention_forward(
     return {S, P, O};
 }
 
-std::vector<torch::Tensor> kv_attention_forward(
+std::vector<torch::Tensor> single_query_attention(
     torch::Tensor &Q,       // [batch_size, dim]
     torch::Tensor &K,       // [batch_size, dim]
     torch::Tensor &V,       // [batch_size, dim]
@@ -258,9 +259,9 @@ std::vector<torch::Tensor> kv_attention_forward(
 
     AT_DISPATCH_FLOATING_TYPES_AND_HALF(
         Q.scalar_type(),
-        "kv_attention_forward_kernel",
+        "single_query_attention_kernel",
         ([&] {
-            kv_attention_forward_kernel<<<blocks, threads, context_len, stream>>>(
+            single_query_attention_kernel<<<blocks, threads, context_len, stream>>>(
                 context_len,
                 dim / num_heads,
                 scale,
@@ -277,9 +278,4 @@ std::vector<torch::Tensor> kv_attention_forward(
     );
 
     return {S, P, O};
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("naive_attention_forward", &naive_attention_forward, "naive attention forward");
-    m.def("kv_attention_forward", &kv_attention_forward, "kv forward");
 }

@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import time
 
-from lm_ops import naive_attention_forward
+from lm_ops import naive_attention
 
 from test_util import get_qkv
 
@@ -32,7 +32,7 @@ def reference_MHA(Q, K, V, mask=None, num_heads=1):
 def test_mha(batch_size, context_size, dim, num_heads, dtype):
     Q, K, V, mask = get_qkv(batch_size=batch_size, context_size=context_size, dim=dim, std=std, dtype=dtype, to_cuda=True)
     S1, P1, O1 = reference_MHA(Q, K, V, mask=mask, num_heads=num_heads)
-    S2, P2, O2 = naive_attention_forward(Q, K, V, mask, num_heads)
+    S2, P2, O2 = naive_attention(Q, K, V, mask, num_heads)
     assert torch.allclose(O1, O2, atol=1e-2)
 
 

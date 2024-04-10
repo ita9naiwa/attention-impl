@@ -57,14 +57,13 @@ __inline__ __device__ T blockReduceMax(T val) {
     }
     int lane = threadIdx.x & 0x1f;
     int wid = threadIdx.x >> 5;
-    val = warpReduceSum<T>(val);
+    val = warpReduceMax<T>(val);
 
     if (lane == 0)
       shared[wid] = val;
     __syncthreads();
     T ret = 0;
-    for(int j = 0; j < 32;++j){
-        ret = max(ret, shared[j]);
-    }
+    val = (threadIdx.x < (blockDim.x / 32.f)) ? shared[lane] : -1e20f;
+    val = warpReduceMax<T>(val);
   return ret;
 }
