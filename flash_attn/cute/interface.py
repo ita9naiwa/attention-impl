@@ -534,6 +534,22 @@ def _compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
 
 
 _compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
+def _bind_vbs128_mask(q, k, block_sparse_tensors, aux_tensors, aux_scalars, mask_mod, arch):
+    """Bind a known mask contract without inferring identity from arbitrary callables."""
+    if mask_mod is not None:
+        raise ValueError("vc_vbs128 requires mask_mod=None; custom callbacks are never replaced")
+    if q is None or k is None or q.ndim != 4 or k.ndim != 4:
+        raise ValueError("vc_vbs128 requires fixed-length BSHD Q and K")
+    if block_sparse_tensors is None or block_sparse_tensors.block_size[1] != 128:
+        raise ValueError("vc_vbs128 requires sparse metadata with physical KV blocks of 128")
+    if aux_scalars is not None or aux_tensors is None or len(aux_tensors) != 1:
+        raise ValueError("vc_vbs128 requires exactly one valid-count tensor and no aux scalars")
+    sizes = aux_tensors[0]
+    if (sizes.dtype != torch.int32 or sizes.ndim != 1 or not sizes.is_contiguous()
+            or sizes.numel() != (k.shape[1] + 127) // 128 or sizes.device != k.device):
+        raise ValueError("vc_vbs128 sizes must be contiguous int32 [ceil(K/128)] on the QKV device")
+    from flash_attn.cute.mask import build_vbs128_mask
+    return build_vbs128_mask(vector=arch // 10 in (10, 11))
 
 
 def _flash_attn_fwd(
@@ -578,6 +594,10 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    vc_expcast: bool = False,
+    vc_mean: Optional[torch.Tensor] = None,
+    vc_vscale: Optional[torch.Tensor] = None,
+    vc_vbs128: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -586,6 +606,8 @@ def _flash_attn_fwd(
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
         block_sparse_tensors: A tuple of tensors used for block sparsity.
+        vc_vbs128: Use the built-in physical-KV128 valid-count mask (aux[0] values in [0,128]).
+            Requires fixed-length sparse QKV and mask_mod=None; enables compact VC when supported.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
             The returned LSE supports taking gradient.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
@@ -697,6 +719,11 @@ def _flash_attn_fwd(
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
+    if vc_vbs128:
+        if (any(x is not None for x in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table))
+                or causal or window_size_left is not None or window_size_right is not None):
+            raise ValueError("vc_vbs128 requires fixed-length, noncausal, nonlocal sparse attention")
+        mask_mod = _bind_vbs128_mask(q, k, block_sparse_tensors, aux_tensors, aux_scalars, mask_mod, arch)
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // v.element_size()
@@ -777,6 +804,26 @@ def _flash_attn_fwd(
         )
 
     dtype = torch2cute_dtype_map[q_dtype]
+    if vc_expcast:
+        assert q_dtype == torch.float8_e4m3fn and arch // 10 == 10 and head_dim in (64,128)
+        assert not causal and window_size_left is None and window_size_right is None
+        assert num_splits == 1 and score_mod is None and page_table is None
+        assert mask_mod is None or block_sparse_tensors is not None
+    if vc_mean is not None or vc_vscale is not None:
+        assert is_fp8 and arch // 10 == 10 and head_dim_v in (64,128)
+        assert not causal and window_size_left is None and window_size_right is None
+        assert num_splits == 1 and score_mod is None and page_table is None
+        assert mask_mod is None or block_sparse_tensors is not None
+        assert cu_seqlens_q is None and cu_seqlens_k is None
+        if vc_mean is not None:
+            assert block_sparse_tensors is None and mask_mod is None, "V-Smooth requires dense attention"
+            assert vc_mean.dtype in (torch.bfloat16, torch.float32), 'vc_mean must be BF16 or FP32'
+            _validate_tensor(vc_mean, 'vc_mean', (batch_size,num_head_kv,(seqlen_k+127)//128,head_dim_v),vc_mean.dtype,device)
+            assert vc_mean.is_contiguous()
+            if not is_fake_mode():
+                assert vc_mean.data_ptr() % 16 == 0
+        if vc_vscale is not None:
+            _validate_tensor(vc_vscale, 'vc_vscale', (batch_size,num_head_kv,head_dim_v),torch.float32,device)
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
@@ -873,6 +920,8 @@ def _flash_attn_fwd(
     use_2cta_instrs = (
         arch // 10 in [10, 11]
         and not requested_disable_2cta
+        # VC's small batched mean MMA is faster without the two-CTA cluster.
+        and not (vc_expcast and vc_mean is not None)
         and not causal
         and not local
         and not is_split_kv
@@ -1152,7 +1201,35 @@ def _flash_attn_fwd(
         )
     )
 
+    # CuTe's runtime scalar flattening expects builtin ints, not int subclasses.
+    if isinstance(max_seqlen_q, int):
+        max_seqlen_q = int(max_seqlen_q)
+
+    # Keep TC-sum eligibility separate from the large-shape scheduler choice.
+    vc_dense_eligible = (
+        arch == 103 and head_dim == 128 and head_dim_v == 128
+        and vc_expcast and vc_mean is None and not use_block_sparsity
+        and cu_seqlens_q is None and cu_seqlens_k is None
+        and seqused_q is None and seqused_k is None
+        and seqlen_q == seqlen_k
+    )
+    vc_nonpersistent = vc_dense_eligible and seqlen_q >= 65536
+    vc_tc_sum_eligible = vc_dense_eligible and seqlen_q >= 16384
+    vc_vbs128_eligible = all((
+        vc_vbs128, arch == 103, vc_expcast, vc_mean is None,
+        head_dim == 128, head_dim_v == 128, qhead_per_kvhead == 1,
+        q_stage == 1, tile_m == 128, tile_n == 128, q_subtile_factor == 1,
+        use_block_sparsity, not use_2cta_instrs, not use_clc_scheduler,
+        not is_varlen, not is_split_kv, not pack_gqa, page_table is None,
+        not causal, not local, score_mod is None, learnable_sink is None,
+    ))
     compile_key = (
+        vc_vbs128_eligible,
+        vc_expcast,
+        vc_nonpersistent,
+        vc_tc_sum_eligible,
+        vc_mean.dtype if vc_mean is not None else None,
+        vc_vscale is not None,
         dtype,
         head_dim,
         head_dim_v,
@@ -1253,10 +1330,13 @@ def _flash_attn_fwd(
                 q_descale=q_descale_tensor,
                 k_descale=k_descale_tensor,
                 v_descale=v_descale_tensor,
+                v_mean=to_cute_tensor(vc_mean, assumed_align=16),
+                v_channel_scale=to_cute_tensor(vc_vscale, assumed_align=4),
             )
             if q_descale_tensor is not None
             or k_descale_tensor is not None
             or v_descale_tensor is not None
+            or vc_mean is not None or vc_vscale is not None
             else None
         )
 
@@ -1390,7 +1470,7 @@ def _flash_attn_fwd(
                     m_block_size=tile_m,
                     n_block_size=tile_n,
                     q_stage=q_stage,
-                    is_static_persistent=is_static_persistent,
+                    is_static_persistent=is_static_persistent and not vc_nonpersistent,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
@@ -1405,6 +1485,17 @@ def _flash_attn_fwd(
                 if not use_dedicated_hd256_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
+                fa_fwd.vc_expcast = vc_expcast
+                if vc_expcast and use_block_sparsity and fa_fwd.is_sm103 and score_mod is None:
+                    # Full sparse iterations use hardware max; masked iterations
+                    # retain the post-mask software reduction in softmax_step.
+                    fa_fwd.use_ldred_rowmax = fa_fwd.head_dim_padded != 32
+                fa_fwd.vc_nonpersistent = vc_nonpersistent
+                fa_fwd.vc_tc_sum_eligible = vc_tc_sum_eligible
+                fa_fwd.vc_vbs128_eligible = vc_vbs128_eligible
+                fa_fwd.vc_smooth = vc_mean is not None
+                if vc_mean is not None:
+                    assert tile_n == 128, 'V means use 128-token blocks'
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
@@ -1517,8 +1608,9 @@ def _flash_attn_fwd(
                 for t in (q_call, k_call, v_call, qv_call)
             ]
         descale_tensors = (
-            DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
-            if q_descale is not None or k_descale is not None or v_descale is not None
+            DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                          v_mean=vc_mean, v_channel_scale=vc_vscale)
+            if q_descale is not None or k_descale is not None or v_descale is not None or vc_mean is not None or vc_vscale is not None
             else None
         )
         if qv is not None:
@@ -1923,9 +2015,22 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    _workspace=None,
+    _return_workspace: bool = False,
 ) -> Tuple[torch.Tensor, ...]:
+    """Run backward, optionally accumulating disjoint KV partitions in one workspace.
+
+    `_return_workspace` defers the final dQ conversion and returns a fourth value.
+    Pass it as `_workspace` on the final partition with the same unmodified
+    Q/O/dO/LSE/dLSE tensors and CUDA stream. O and LSE must describe the complete
+    attention, not a separately normalized partition. The final call converts dQ
+    once. Ordinary calls retain the three-tensor return contract.
+    """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
+    if _workspace is not None or _return_workspace:
+        assert learnable_sink is None and not fake_mode
+        assert q.numel() > 0 and k.numel() > 0
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     if block_sparse_tensors is not None:
@@ -2212,7 +2317,25 @@ def _flash_attn_bwd(
     hdim_multiple_of = 64 if arch // 10 == 9 and dKV_swapAB else 32
     head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
-    if cu_seqlens_q is None:
+    # Private two-partition protocol: only the first call initializes dQ.
+    if _workspace is not None or _return_workspace:
+        assert arch // 10 == 10 and head_dim in (64, 128)
+        assert not use_2cta_instrs and not deterministic and qhead_per_kvhead == 1
+        assert cu_seqlens_q is None and cu_seqlens_k is None
+        assert seqused_q is None and seqused_k is None
+        assert not causal and not local and score_mod is None and score_mod_bwd is None
+    # A workspace belongs to one normalization state and one CUDA stream.
+    workspace_context = (
+        q, out, dout, lse, dlse, softmax_scale, m_block_size,
+        torch.cuda.current_stream(device).cuda_stream,
+    ) if (_workspace is not None or _return_workspace) else None
+    if _workspace is not None:
+        dq_accum, dpsum, lse_log2, previous = _workspace
+        assert all(x is y for x, y in zip(workspace_context[:5], previous[:5]))
+        assert workspace_context[5:] == previous[5:]
+        assert dq_accum.shape == (batch_size, num_head, seqlen_q_rounded * head_dim_rounded)
+        assert dpsum.shape == lse_log2.shape == (batch_size, num_head, seqlen_q_rounded)
+    elif cu_seqlens_q is None:
         dq_accum = (
             None
             if use_dedicated_hd256_kernel
@@ -2323,14 +2446,15 @@ def _flash_attn_bwd(
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
-    _bwd_preprocess(
-        out, dout, dpsum, lse, lse_log2, dq_accum,
-        cu_seqlens_q, seqused_q, dlse,
-        dtype, head_dim, head_dim_v, m_block_size,
-        cu_total_m_blocks=cu_total_m_blocks_q,
-        fake_mode=fake_mode,
-        hdim_multiple_of=hdim_multiple_of,
-    )
+    if _workspace is None:
+        _bwd_preprocess(
+            out, dout, dpsum, lse, lse_log2, dq_accum,
+            cu_seqlens_q, seqused_q, dlse,
+            dtype, head_dim, head_dim_v, m_block_size,
+            cu_total_m_blocks=cu_total_m_blocks_q,
+            fake_mode=fake_mode,
+            hdim_multiple_of=hdim_multiple_of,
+        )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
     if arch // 10 not in [9, 12]:
@@ -2339,7 +2463,10 @@ def _flash_attn_bwd(
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
-    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
+    mask_mod_hash = (
+        utils.hash_callable(mask_mod, mixer_attrs=utils._MIXER_ATTRS + ("__q_block_invariant__", "__vbs_kv_block_size__"))
+        if mask_mod else False
+    )
     num_aux_tensors = len(aux_tensors) if aux_tensors else 0
     aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors) if aux_tensors is not None else None
     aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
@@ -2718,21 +2845,22 @@ def _flash_attn_bwd(
             num_threads_post_dQ = 128
             num_threads_post_dKV = 128
 
-        _bwd_postprocess_convert(
-            dq_accum, dq, softmax_scale,
-            cu_seqlens_q, seqused_q,
-            arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
-            AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs, cluster_size=1,
-            cu_total_m_blocks=cu_total_m_blocks_q,
-            sink_tensors=(
-                LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
-                if learnable_sink is not None
-                else None
-            ),
-            fake_mode=fake_mode,
-            hdim_multiple_of=hdim_multiple_of,
-        )
+        if not _return_workspace:
+            _bwd_postprocess_convert(
+                dq_accum, dq, softmax_scale,
+                cu_seqlens_q, seqused_q,
+                arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
+                AtomLayoutMdQ, dQ_swapAB,
+                use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+                cu_total_m_blocks=cu_total_m_blocks_q,
+                sink_tensors=(
+                    LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
+                    if learnable_sink is not None
+                    else None
+                ),
+                fake_mode=fake_mode,
+                hdim_multiple_of=hdim_multiple_of,
+            )
 
         if dKV_postprocess:
             # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
@@ -2758,6 +2886,8 @@ def _flash_attn_bwd(
                 hdim_multiple_of=hdim_multiple_of,
             )
 
+    if _return_workspace:
+        return dq, dk, dv, (dq_accum, dpsum, lse_log2, workspace_context)
     return (dq, dk, dv) if learnable_sink is None else (dq, dk, dv, dsink)
 
 

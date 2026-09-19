@@ -3,6 +3,7 @@
 from typing import Optional, Callable, TypeAlias, Tuple
 from dataclasses import dataclass
 import enum
+from functools import lru_cache
 
 import cutlass
 import cutlass.cute as cute
@@ -837,6 +838,42 @@ class AttentionMask:
                             kv_out_of_bounds = global_kv >= self.seqlen_k
                             out_of_bounds = q_out_of_bounds or kv_out_of_bounds
                             acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
+            elif const_expr(
+                all(
+                    (
+                        getattr(mask_mod, "__q_block_invariant__", 0) in (128, 256),
+                        getattr(mask_mod, "__vec_size__", 1) == 1,
+                        self.tile_m == 128,
+                        self.tile_n == 128,
+                        self.swap_AB,
+                    )
+                )
+            ):
+                # Opt-in promise: the callback, including auxiliary reads, is constant
+                # in Q within each aligned 256-token block. Each lane owns one
+                # KV row and all its Q columns belong to one aligned 128-token tile.
+                # Use that tile's actual Q position, not the first sequence block.
+                representative_q = m_block * self.tile_m
+                global_kv = tScS_t2r[0][COL] + n_block * self.tile_n
+                keep = (representative_q < self.seqlen_q) & (global_kv < self.seqlen_k)
+                if keep:
+                    value = call_mask_mod(
+                        mask_mod,
+                        utils.scalar_to_ssa(batch_idx, cutlass.Int32),
+                        utils.scalar_to_ssa(head_idx, cutlass.Int32),
+                        utils.scalar_to_ssa(representative_q, cutlass.Int32),
+                        utils.scalar_to_ssa(global_kv, cutlass.Int32),
+                        self.seqlen_info,
+                        aux_data,
+                    )
+                    keep = cutlass.Boolean(utils.ssa_to_scalar(value))
+                if not keep:
+                    for i in cutlass.range_constexpr(cute.size(tScS_t2r.shape)):
+                        acc_S[i] = -cutlass.Float32.inf
+                elif check_m_boundary:
+                    for i in cutlass.range_constexpr(cute.size(tScS_t2r.shape)):
+                        global_q = tScS_t2r[i][ROW] + representative_q
+                        acc_S[i] = acc_S[i] if global_q < self.seqlen_q else -cutlass.Float32.inf
             else:
                 # Partial block
                 has_fastdiv = const_expr(
@@ -1709,3 +1746,98 @@ class Sm100FusedMask:
             # Residual mask is always needed for boundary protection.
             if index_k >= seqlen_k or index_q >= seqlen_q:
                 acc_qk[i] = -Float32.inf
+
+
+@lru_cache(maxsize=2)
+def build_vbs128_mask(vector: bool):
+    """Built-in physical-KV128 valid-count mask; aux[0] is contiguous int32 [KV blocks]."""
+
+    @cute.jit
+    def vbs128_mask(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+        if const_expr(vector):
+            base = n_idx[0]
+            limit = aux_tensors[0][base // 128] - base % 128
+            packed = cute.make_rmem_tensor(4, Uint32)
+            for word in cutlass.range_constexpr(4):
+                packed[word] = r2p_bitmask_below(limit, word)
+            return packed.load()
+        else:
+            block_size = utils.scalar_to_ssa(128, Int32)
+            block = n_idx // block_size
+            valid = utils.scalar_to_ssa(aux_tensors[0][block[0]], Int32)
+            return (valid > utils.scalar_to_ssa(0, Int32)) & (n_idx % block_size < valid)
+
+    if vector:
+        vbs128_mask.__vec_size__ = 128
+    return vbs128_mask
+
+
+@cute.jit
+def vbs128_mask_bits(
+    mask,
+    m_block,
+    n_block,
+    thr_mma,
+    thr_tmem_load,
+    mask_seqlen: cutlass.Constexpr,
+    mask_causal: cutlass.Constexpr,
+    mask_local: cutlass.Constexpr = False,
+    mask_mod: cutlass.Constexpr = None,
+    batch_idx=None,
+    head_idx=None,
+    aux_data: AuxData = AuxData(),
+    fastdiv_mods=(None, None),
+    head_divmod=None,
+    vec_size: cutlass.Constexpr = 128,
+    check_q_boundary=False,
+):
+    assert not mask_causal and not mask_local
+    assert mask.tile_m == 128 and mask.tile_n == 128
+    assert not mask.swap_AB and mask.qhead_per_kvhead_packgqa == 1
+    if n_block < 0:
+        n_block = 0
+    words = cute.make_rmem_tensor(4, Uint32)
+    limit = mask.seqlen_k - n_block * 128
+    if const_expr(mask_mod is None):
+        # Baseline full/boundary branch does not apply query-row zeroing.
+        for word in cutlass.range_constexpr(4):
+            words[word] = (
+                r2p_bitmask_below(limit, word) if const_expr(mask_seqlen) else Uint32(0xFFFFFFFF)
+            )
+    else:
+        assert vec_size == 128
+        coords = thr_mma.partition_C(cute.make_identity_tensor((128, 128)))
+        coords = thr_tmem_load.partition_D(coords[(None, None), 0, 0])
+        assert cute.size(coords.shape) == 128
+        row = coords[0][0] + m_block * 128
+        base_col = coords[0][1] + n_block * 128
+        wrapped_row = row
+        has_fastdiv = const_expr(
+            fastdiv_mods is not None and fastdiv_mods[0] is not None and fastdiv_mods[1] is not None
+        )
+        if const_expr(has_fastdiv and aux_data.tensors is not None):
+            if check_q_boundary:
+                _, wrapped_row = divmod(row, fastdiv_mods[0])
+        columns = cute.make_rmem_tensor(128, Int32)
+        for j in cutlass.range_constexpr(128):
+            col = coords[j][1] + n_block * 128
+            if const_expr(has_fastdiv and mask_seqlen and aux_data.tensors is not None):
+                _, col = divmod(col, fastdiv_mods[1])
+            columns[j] = col
+        packed = call_mask_mod(
+            mask_mod,
+            utils.scalar_to_ssa(batch_idx, Int32).broadcast_to((128,)),
+            utils.scalar_to_ssa(head_idx, Int32).broadcast_to((128,)),
+            utils.scalar_to_ssa(wrapped_row, Int32).broadcast_to((128,)),
+            columns.load(),
+            mask.seqlen_info,
+            aux_data,
+        )
+        for word in cutlass.range_constexpr(4):
+            value = packed[word]
+            if const_expr(mask_seqlen):
+                value = value & r2p_bitmask_below(mask.seqlen_k - base_col, word)
+            if check_q_boundary:
+                value = value if row < mask.seqlen_q else Uint32(0)
+            words[word] = value
+    return words

@@ -145,6 +145,22 @@ class FlashAttentionBackwardSm100:
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
         self.mask_mod = mask_mod
+        # Marker promises aux[0] is a 1D KV128 valid-prefix length array,
+        # independent of Q, batch and head; it is not an arbitrary mask hint.
+        self.hoist_vbs = (
+            getattr(mask_mod, "__vbs_kv_block_size__", 0) == 128
+            and tile_m == tile_n == 128
+            and head_dim == head_dim_v == 128
+            and cluster_size == 1
+            and qhead_per_kvhead == 1
+            and not is_causal
+            and not is_local
+            and not deterministic
+            and score_mod is None
+            and score_mod_bwd is None
+            and has_aux_tensors
+            and kv_subtile_factor == 1
+        )
         self.has_aux_tensors = has_aux_tensors
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
@@ -529,6 +545,12 @@ class FlashAttentionBackwardSm100:
 
         self.is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
+        self.hoist_vbs = (
+            self.hoist_vbs
+            and self.q_dtype == cutlass.BFloat16
+            and not self.is_varlen_q
+            and not self.is_varlen_k
+        )
         self.use_tma_store = not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
         # self.use_tma_store = not self.qhead_per_kvhead == 1
         self.dKV_postprocess = self.qhead_per_kvhead > 1
@@ -3220,6 +3242,16 @@ class FlashAttentionBackwardSm100:
                 )
                 process_tile = loop_count > Int32(0)
 
+            if const_expr(self.hoist_vbs):
+                # In the admitted 128x128 single-CTA layout, Ld32x32b assigns
+                # each lane one KV row; both register stages vary only Q columns.
+                # Thus every tScS_t2r[i][0] equals tScS_t2r[0][0].
+                vbs_row = tScS_t2r[0][0]
+                vbs_limit = Int32(aux_data.tensors[0][n_block])
+                vbs_keep = (vbs_row < vbs_limit) & (
+                    n_block * self.tile_n + vbs_row < seqlen.seqlen_k
+                )
+
             # Mainloop
             # Block sparsity: iterate over sparse m_block count and derive actual m_block
             # from Q_IDX/FULL_Q_IDX tensors. Dense: iterate m_block_min..m_block_max directly.
@@ -3298,12 +3330,21 @@ class FlashAttentionBackwardSm100:
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
                 check_m_boundary = (m_block + 1) * self.tile_m > seqlen.seqlen_q
-                mask_fn(
-                    tSrS_t2r,
-                    m_block=m_block,
-                    is_full_block=is_full_block,
-                    check_m_boundary=check_m_boundary,
-                )
+                if const_expr(self.hoist_vbs):
+                    if not vbs_keep:
+                        for i in cutlass.range_constexpr(cute.size(tScS_t2r.shape)):
+                            tSrS_t2r[i] = -Float32.inf
+                    elif check_m_boundary:
+                        for i in cutlass.range_constexpr(cute.size(tScS_t2r.shape)):
+                            q_pos = m_block * self.tile_m + tScS_t2r[i][1]
+                            tSrS_t2r[i] = tSrS_t2r[i] if q_pos < seqlen.seqlen_q else -Float32.inf
+                else:
+                    mask_fn(
+                        tSrS_t2r,
+                        m_block=m_block,
+                        is_full_block=is_full_block,
+                        check_m_boundary=check_m_boundary,
+                    )
                 num_stages = cute.size(tScS_t2r, mode=[1])
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
