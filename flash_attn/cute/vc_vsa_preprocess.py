@@ -44,7 +44,7 @@ def _library(device):
         _ok(nvrtc.nvrtcDestroyProgram(program))
     return native._load_module(
         ctypes.create_string_buffer(bytes(ptx)),
-        ("vsa_stats", "vsa_reduce", "vsa_quantize", "vsa_routes"),
+        ("vsa_stats", "vsa_reduce", "vsa_quantize", "vsa_routes", "vsa_routes_sorted", "vsa_routes_warp"),
     )
 
 
@@ -210,10 +210,11 @@ def prepare_vsa_routes(selected, sizes, block_size, prefix, document_start=0):
     mask_idx = torch.empty_like(full_idx)
     full_cnt = torch.empty((b, h, q), dtype=torch.int32, device=selected.device)
     mask_cnt = torch.empty_like(full_cnt)
+    short_route = prefix + topk <= 32 and parents <= 1073741823
     with torch.cuda.device(selected.device):
         _launch(
-            "vsa_routes",
-            (rows, 1, 1),
+            "vsa_routes_warp" if short_route else ("vsa_routes_sorted" if prefix + topk <= 1024 and parents <= 1073741823 else "vsa_routes"),
+            ((rows + 3) // 4 if short_route else rows, 1, 1),
             128,
             (selected, sizes, full_idx, full_cnt, mask_idx, mask_cnt),
             (rows, topk, prefix, document_start, block_size, capacity, parents),

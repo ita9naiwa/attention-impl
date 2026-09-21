@@ -210,7 +210,6 @@ __device__ __forceinline__ int vsa_route_parent(
  return (int)(global - document_start);
 }
 
-// ponytail: quadratic ranking suits small top-k lists; use a parallel sort for large routes.
 extern "C" __global__ void vsa_routes(
  const int64_t *selected, const int *sizes, int *full_idx, int *full_cnt,
  int *mask_idx, int *mask_cnt, int rows, int topk, int prefix,
@@ -247,5 +246,65 @@ extern "C" __global__ void vsa_routes(
   int *out=kind==1?full_idx:mask_idx;
   for (int child=0;child<factor;++child)
    out[offset+rank*factor+child]=parent*factor+child;
+ }
+}
+
+extern "C" __global__ void vsa_routes_sorted(
+ const int64_t *selected, const int *sizes, int *full_idx, int *full_cnt,
+ int *mask_idx, int *mask_cnt, int rows, int topk, int prefix,
+ int document_start, int block_size, int capacity, int parents) {
+ int row=blockIdx.x, tid=threadIdx.x;
+ __shared__ int keys[1024]; __shared__ int nf,nm;
+ int total=prefix+topk, n=1; while(n<total)n*=2;
+ for(int i=tid;i<n;i+=blockDim.x){
+  int p=i<total?vsa_route_parent(selected,row,topk,i,prefix,document_start,parents):-1;
+  int sz=p>=0?sizes[p]:0;
+  keys[i]=sz==block_size?p:(sz>0&&sz<block_size?p+parents:2147483647);
+ }
+ __syncthreads();
+ for(int k=2;k<=n;k*=2)for(int j=k/2;j>0;j/=2){
+  for(int i=tid;i<n;i+=blockDim.x){int other=i^j;
+   if(other>i){int a=keys[i],b=keys[other]; if((a>b)==((i&k)==0)){keys[i]=b;keys[other]=a;}}
+  } __syncthreads();
+ }
+ if(tid==0){nf=0;nm=0;for(int i=0;i<total;i++){nf+=keys[i]<parents;nm+=keys[i]>=parents&&keys[i]<2147483647;}
+  full_cnt[row]=nf*(block_size/128);mask_cnt[row]=nm*(block_size/128);}
+ __syncthreads();
+ int factor=block_size/128;int64_t offset=(int64_t)row*capacity;
+ for(int i=tid;i<capacity;i+=blockDim.x){int ix=i/factor,child=i%factor;
+  full_idx[offset+i]=ix<nf?keys[ix]*factor+child:-1;
+  mask_idx[offset+i]=ix<nm?(keys[nf+ix]-parents)*factor+child:-1;}
+}
+
+
+// One complete warp owns one short route; sentinel lanes participate in every shuffle.
+extern "C" __global__ void vsa_routes_warp(
+ const int64_t *selected, const int *sizes, int *full_idx, int *full_cnt,
+ int *mask_idx, int *mask_cnt, int rows, int topk, int prefix,
+ int document_start, int block_size, int capacity, int parents) {
+ int lane=threadIdx.x%32, row=blockIdx.x*4+threadIdx.x/32;
+ if (row>=rows) return;
+ int parent=lane<prefix+topk?vsa_route_parent(selected,row,topk,lane,prefix,document_start,parents):-1;
+ int size=parent>=0?sizes[parent]:0;
+ int key=size==block_size?parent:(size>0&&size<block_size?parent+parents:2147483647);
+ #pragma unroll
+ for (int k=2;k<=32;k*=2) {
+  #pragma unroll
+  for (int j=k/2;j>0;j/=2) {
+   int other=__shfl_xor_sync(0xffffffff,key,j);
+   bool ascending=(lane&k)==0, lower=(lane&j)==0;
+   key=(ascending==lower)?min(key,other):max(key,other);
+  }
+ }
+ int nf=__popc(__ballot_sync(0xffffffff,key<parents));
+ int nm=__popc(__ballot_sync(0xffffffff,key>=parents&&key<2147483647));
+ int factor=block_size/128;int64_t offset=(int64_t)row*capacity;
+ for(int i=lane;i<capacity;i+=32){full_idx[offset+i]=-1;mask_idx[offset+i]=-1;}
+ __syncwarp();
+ if(lane==0){full_cnt[row]=nf*factor;mask_cnt[row]=nm*factor;}
+ if(key<2147483647){
+  bool full=key<parents;int rank=full?lane:lane-nf;
+  int *out=full?full_idx:mask_idx;int p=full?key:key-parents;
+  for(int child=0;child<factor;++child)out[offset+rank*factor+child]=p*factor+child;
  }
 }
