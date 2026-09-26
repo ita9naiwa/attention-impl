@@ -1032,7 +1032,9 @@ def softmax_block_sparse_sm100_list(
             s0_s1_sequence_phase,
             physical_n_block(block_end - 1 - i),
             mask_fn=None
-            if const_expr(full_inner_noop or (allow_unmasked_inner_blocks and check_m_boundary is False))
+            if const_expr(
+                full_inner_noop or (allow_unmasked_inner_blocks and check_m_boundary is False)
+            )
             else partial(
                 mask_fn_base,
                 mask_seqlen=False,
