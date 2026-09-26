@@ -532,6 +532,147 @@ def test_native_pipeline():
     )
 
 
+def _vbs_vector_mask():
+    import cutlass
+    import cutlass.cute as cute
+    from flash_attn.cute.mask import r2p_bitmask_below
+
+    @cute.jit
+    def mask(batch, head, m_idx, n_idx, seqlen_info, aux_tensors):
+        base = n_idx[0]
+        limit = aux_tensors[0][base // 128] - base % 128
+        packed = cute.make_rmem_tensor(4, cutlass.Uint32)
+        for word in cutlass.range_constexpr(4):
+            packed[word] = r2p_bitmask_below(limit, word)
+        return packed.load()
+
+    mask.__vec_size__ = 128
+    return mask
+
+
+@torch.no_grad()
+def test_full_inner_hwmax_exact():
+    """FA_VC_FULL_INNER_HWMAX must reproduce the default VC Q256 sparse kernel bit for bit."""
+    if torch.cuda.get_device_capability() != (10, 3):
+        print("SKIP full-inner hwmax: requires SM103")
+        return
+    from flash_attn.cute import interface, utils
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+    records = []
+    original_kernel, original_flag = interface.FlashAttentionForwardSm100, utils._fa_vc_full_inner_hwmax_enabled
+
+    class Traced(original_kernel):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            records.append(self)
+
+    interface.FlashAttentionForwardSm100 = Traced
+    original_cache, interface._flash_attn_fwd.compile_cache = interface._flash_attn_fwd.compile_cache, {}
+    mask = _vbs_vector_mask()
+    heads, nk = 2, 10
+    torch.manual_seed(7)
+
+    def lists(sizes, sq, pattern):
+        # pattern[h][m] -> selected physical KV blocks; classify by size like the VC wrapper.
+        mb = (sq + 255) // 256
+        idx = {n: torch.zeros(1, heads, mb, nk, dtype=torch.int32) for n in ("full", "mask")}
+        cnt = {n: torch.zeros(1, heads, mb, dtype=torch.int32) for n in ("full", "mask")}
+        for h in range(heads):
+            for m in range(mb):
+                for b in sorted(pattern[h][m]):
+                    kind = "full" if sizes[b] == 128 else "mask" if sizes[b] > 0 else None
+                    if kind:
+                        idx[kind][0, h, m, cnt[kind][0, h, m]] = b
+                        cnt[kind][0, h, m] += 1
+        return [t.cuda() for t in (cnt["mask"], idx["mask"], cnt["full"], idx["full"])]
+
+    def payload(kind, sq, sk):
+        if kind == "random":
+            q = torch.randn(1, sq, heads, 128, device="cuda") * 120
+            k = torch.randn(1, sk, heads, 128, device="cuda") * 120
+        else:  # extrema, signed zeros, ties, all-negative rows, per-tile changing maxima
+            q = torch.full((1, sq, heads, 128), 448.0, device="cuda")
+            q[:, 1::3] = -0.0
+            q[:, 2::5, :, ::2] = -448.0
+            level = -(torch.arange(sk, device="cuda") // 128 % 4).float() * 112 - 1
+            k = level[None, :, None, None].expand(1, sk, heads, 128).clone()
+            k[:, 3::7] = 448.0
+            k[:, 5::11] = 0.0
+        v = torch.randn(1, sk, heads, 128, device="cuda") * 200
+        return [t.clamp(-448, 448).to(torch.float8_e4m3fn).contiguous() for t in (q, k, v)]
+
+    patterns = {  # per head, per Q256 block; includes empty, masked-only and >=3-full lists
+        "a": [[[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], [1, 3, 4, 6, 8], []], [[0, 2, 4, 6, 8], [0, 1, 2, 3, 9], [5]]],
+        "b": [[[9, 7, 5, 3, 1, 0], [2], [0, 2, 3, 4, 5, 6]], [[1, 4], [], [0, 3, 6, 7, 8]]],
+    }
+    cases = [  # (payload, sq, sk, sizes, pattern)
+        ("random", 768, 1280, [128] * 10, "a"),
+        ("random", 768, 1280, [128, 77, 128, 128, 0, 128, 128, 1, 128, 128], "a"),
+        ("extreme", 768, 1280, [128, 128, 128, 5, 128, 128, 128, 128, 64, 128], "b"),
+        ("random", 728, 1280, [128, 128, 128, 128, 128, 90, 128, 128, 128, 128], "b"),  # Q edge
+        ("random", 768, 1230, [128] * 9 + [78], "a"),  # ragged K
+    ]
+    qs = torch.full((1, heads), 1e-3, device="cuda")
+    ks = torch.tensor([[1e-3, 3e-4]], device="cuda")
+    vs = torch.rand(1, heads, 128, device="cuda") + 0.5
+    try:
+        for kind, sq, sk, sizes, pat in cases:
+            q, k, v = payload(kind, sq, sk)
+            aux = torch.tensor(sizes, device="cuda", dtype=torch.int32)
+            mc, mi, fc, fi = lists(sizes, sq, patterns[pat])
+            sparse = BlockSparseTensorsTorch(mc, mi, fc, fi, block_size=(256, 128))
+
+            def run():
+                return interface._flash_attn_fwd(
+                    q, k, v, q_descale=qs, k_descale=ks, vc_vscale=vs, vc_expcast=True,
+                    tile_mn=(128, 128), max_seqlen_q=sq, mask_mod=mask,
+                    block_sparse_tensors=sparse, aux_tensors=[aux], return_lse=True,
+                )[:2]
+
+            results = []
+            for flag in (False, True):
+                utils._fa_vc_full_inner_hwmax_enabled = flag
+                before = len(records)
+                results.append([t.clone() for t in run()])
+                if len(records) > before:  # freshly compiled kernel object
+                    assert records[-1].vc_sparse_stats_overlap and records[-1].vc_full_inner_hwmax == flag
+            (out0, lse0), (out1, lse1) = results
+            assert torch.equal(out0, out1) and torch.equal(lse0, lse1), (kind, sq, sk, sizes)
+            assert torch.isfinite(out1.float()).all()
+            empty = (mc + fc)[0, :, :].repeat_interleave(256, -1)[:, :sq] == 0  # (H, Sq)
+            assert torch.count_nonzero(out1[0].transpose(0, 1)[empty]) == 0
+            print("full-inner hwmax exact", kind, sq, sk, flush=True)
+        assert {r.vc_full_inner_hwmax for r in records} == {False, True}, len(records)
+        # Changed auxiliary sizes, lists and V under CUDA Graph replay of the opted-in kernel.
+        utils._fa_vc_full_inner_hwmax_enabled = True
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            run()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        for sizes2, pat2 in (([128] * 10, "a"), ([128, 128, 3, 128, 128, 128, 0, 128, 128, 128], "b")):
+            aux.copy_(torch.tensor(sizes2, device="cuda", dtype=torch.int32))
+            for dst, src in zip((mc, mi, fc, fi), lists(sizes2, sq, patterns[pat2])):
+                dst.copy_(src)
+            v.copy_((-v.float()).to(v.dtype))
+            for t in captured:
+                t.fill_(float("nan"))
+            graph.replay()
+            utils._fa_vc_full_inner_hwmax_enabled = False
+            ref = run()
+            utils._fa_vc_full_inner_hwmax_enabled = True
+            assert all(torch.equal(a, b) for a, b in zip(captured, ref)), sizes2
+        print("PASS full-inner hwmax: exact out/LSE across full/masked/empty, Q/K edges, graph replay", flush=True)
+    finally:
+        interface.FlashAttentionForwardSm100 = original_kernel
+        interface._flash_attn_fwd.compile_cache = original_cache
+        utils._fa_vc_full_inner_hwmax_enabled = original_flag
+
+
 if __name__ == "__main__":
     test_native_preparation()
     test_expcast_reference()
@@ -539,3 +680,4 @@ if __name__ == "__main__":
     test_persistent_mean_synchronization()
     test_vsmooth_reference()
     test_native_pipeline()
+    test_full_inner_hwmax_exact()
