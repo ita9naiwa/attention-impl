@@ -322,6 +322,11 @@ def test_vsa_delayed_state():
         assert_same(run(v2, m2, s2, q2, block, state), run(v2, m2, s2, q2, block))
         assert state.signature == (v2[0].device, dtype, 2, h, d, block)
     assert state.fallbacks.item() == 0
+    # Head-dim change with the same batch/heads (channel buffers change shape): cold path, then back.
+    for d in (64, 128, 64):
+        v2, m2, s2, q2 = make_inputs(256, d, torch.bfloat16, 2, 3)
+        assert_same(run(v2, m2, s2, q2, 256, state), run(v2, m2, s2, q2, 256))
+        assert state.signature[4] == d and state.vs.shape[-1] == d
     print("T4 signature mismatch -> cold PASS", flush=True)
 
     # T3: CUDA graph capture/replay with a state and mutated inputs == eager with a cloned state.

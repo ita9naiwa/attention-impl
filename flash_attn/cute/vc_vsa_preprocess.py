@@ -95,8 +95,12 @@ class VCScaleState:
         self.saturations = None
 
     def _init(self, signature, kmean, qs, ks, vs):
-        if self.signature is not None and self.qs.shape == qs.shape and self.qs.device == qs.device:
-            for dst, src in zip((self.kmean, self.qs, self.ks, self.vs), (kmean, qs, ks, vs)):
+        fresh = (kmean, qs, ks, vs)
+        buffers = None if self.signature is None else (self.kmean, self.qs, self.ks, self.vs)
+        if buffers is not None and all(
+            a.shape == b.shape and a.device == b.device for a, b in zip(buffers, fresh)
+        ):
+            for dst, src in zip(buffers, fresh):
                 dst.copy_(src)
         else:
             self.kmean, self.qs, self.ks, self.vs = (
