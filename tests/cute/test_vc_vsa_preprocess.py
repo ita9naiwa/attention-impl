@@ -322,6 +322,11 @@ def test_vsa_delayed_state():
         assert_same(run(v2, m2, s2, q2, block, state), run(v2, m2, s2, q2, block))
         assert state.signature == (v2[0].device, dtype, 2, h, d, block)
     assert state.fallbacks.item() == 0
+    # Batch change with the same heads/head-dim (per-head buffers change shape): cold path, then back.
+    for bsz in (1, 2):
+        v2, m2, s2, q2 = make_inputs(256, 128, torch.bfloat16, bsz, 3)
+        assert_same(run(v2, m2, s2, q2, 256, state), run(v2, m2, s2, q2, 256))
+        assert state.signature[2] == bsz and state.qs.shape[0] == bsz
     # Head-dim change with the same batch/heads (channel buffers change shape): cold path, then back.
     for d in (64, 128, 64):
         v2, m2, s2, q2 = make_inputs(256, d, torch.bfloat16, 2, 3)
