@@ -1,7 +1,11 @@
+import contextlib
 import itertools
 import json
+import tempfile
+from pathlib import Path
 
 import torch
+from flash_attn.cute import vc_vsa_preprocess as vsa
 from flash_attn.cute.vc_preprocess import prepare
 from flash_attn.cute.vc_vsa_preprocess import VCScaleState, prepare_vsa
 
@@ -355,6 +359,219 @@ def test_vsa_delayed_state():
     print("T3 CUDA graph with state PASS", flush=True)
 
 
+def ungrouped_library():
+    """vc_vsa_preprocess.cu with the grouped D128 stats loads undone: the three original read_contiguous calls."""
+    src = Path(vsa.__file__).with_suffix(".cu").read_text()
+    call = "read_qkv_contiguous<D>(q,k,v,base+lane*W,dtype,rawq,rawk,rawv);"
+    assert src.count(call) == 1
+    loads = "\n                ".join(
+        f"read_contiguous<D>({x},base+lane*W,dtype,raw{x});" for x in "qkv"
+    )
+    helper = src[src.index("// Stats D128:") : src.index("__device__ int64_t vsa_index")]
+    src = src.replace(call, loads).replace(helper, "")
+    saved = vsa.__file__
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "vc_vsa_preprocess.cu").write_text(src)
+        vsa.__file__ = str(Path(tmp) / "vc_vsa_preprocess.py")
+        try:
+            return vsa._library.__wrapped__(torch.cuda.current_device())
+        finally:
+            vsa.__file__ = saved
+
+
+@contextlib.contextmanager
+def using(library):
+    saved = vsa._library
+    vsa._library = lambda device: library
+    try:
+        yield
+    finally:
+        vsa._library = saved
+
+
+def raw(x):
+    return x.detach().contiguous().reshape(-1).view(torch.uint8)
+
+
+def snapshot(result, state):
+    p, pools = result
+    out = [(key, p[key]) for key in sorted(p)] + [(f"pool{i}", x) for i, x in enumerate(pools)]
+    names = ("kmean", "qs", "ks", "vs", "fallbacks", "saturations")
+    return [(n, x.clone()) for n, x in out + [(f"state.{n}", getattr(state, n)) for n in names]]
+
+
+def assert_raw(a, b, what):
+    for (name, x), (other, y) in zip(a, b, strict=True):
+        assert name == other and x.dtype == y.dtype and x.shape == y.shape, (what, name)
+        assert torch.equal(raw(x), raw(y)), (what, name)
+
+
+def placed(x, offset):
+    """Contiguous copy of x at a storage offset of `offset` elements (breaks 8B alignment for BF16 1..3)."""
+    y = torch.zeros(x.numel() + offset, dtype=x.dtype, device=x.device)[offset:].view(x.shape)
+    return y.copy_(x)
+
+
+def special(x, kind):
+    if kind == "normal":
+        return x
+    info = torch.finfo(x.dtype)
+    if kind == "finite":
+        pool = [
+            0.0,
+            -0.0,
+            info.smallest_normal / 4,
+            -info.smallest_normal / 2,
+            info.tiny,
+            info.max / 2,
+            -info.max / 4,
+        ]
+    else:
+        pool = [float("inf"), float("-inf"), float("nan"), 1.0, -2.0]
+    x = x.clone()
+    flat = x.view(-1)
+    index = torch.randperm(flat.numel(), device=x.device)[: flat.numel() // 8]
+    choice = torch.tensor(pool, device=x.device, dtype=x.dtype)
+    flat[index] = choice[torch.randint(len(pool), (index.numel(),), device=x.device)]
+    if kind == "finite":
+        x[0, :, 0] = -0.0  # a whole (b, h) of signed zeros
+        x[-1, :, -1] = 0.0
+    return x
+
+
+@torch.no_grad()
+def test_vsa_stats_grouped_loads_raw_bytes():
+    """Raw-byte parity of the grouped D128 stats loads against the original per-input loads."""
+    torch.manual_seed(20260927)
+    torch.zeros(1, device="cuda")  # the driver-API module load needs the primary context
+    base = ungrouped_library()
+    new = vsa._library(torch.cuda.current_device())
+
+    def both(values, m, s, qm, block, query_tokens=None, states=(None, None)):
+        out = []
+        for library, state in zip((base, new), states):
+            state = VCScaleState() if state is None else state
+            with using(library):
+                out.append(snapshot(run(values, m, s, qm, block, state, query_tokens), state))
+        return out
+
+    offsets = [
+        (0, 0, 0),
+        (1, 1, 1),
+        (2, 2, 2),
+        (3, 3, 3),
+        (4, 4, 4),
+        (0, 1, 0),
+        (0, 0, 2),
+        (3, 0, 0),
+    ]
+    metadata = list(itertools.product((torch.int32, torch.int64), repeat=3))
+    cases = 0
+    for n, (block, d, dtype, kind) in enumerate(
+        itertools.product(
+            (128, 256),
+            (64, 128),
+            (torch.bfloat16, torch.float16, torch.float32),
+            ("normal", "finite", "nonfinite"),
+        )
+    ):
+        values, m, s, qm = make_inputs(block, d, dtype, 2, 3, metadata[n % 8])
+        values = [special(x, kind) for x in values]
+        for offset in offsets if dtype == torch.bfloat16 else offsets[:2] + offsets[5:6]:
+            placed_values = [placed(x, o) for x, o in zip(values, offset)]
+            if dtype == torch.bfloat16:
+                assert [x.data_ptr() % 8 != 0 for x in placed_values] == [
+                    o % 4 != 0 for o in offset
+                ]
+            a, b = both(placed_values, m, s, qm, block)
+            assert_raw(a, b, (block, d, dtype, kind, offset))
+            cases += 1
+        a, b = both(
+            values, m, s, torch.full_like(qm, -1), block, query_tokens=0
+        )  # every query invalid
+        assert_raw(a, b, (block, d, dtype, kind, "no queries"))
+    values, m, s, qm, nq = canonical_like()
+    for offset in offsets[:3]:
+        v = [placed(x, o) for x, o in zip(values, offset)]
+        assert_raw(*both(v, m, s, qm, 256, query_tokens=nq), ("canonical", offset))
+    print(f"cold raw-byte parity PASS ({cases} cases)", flush=True)
+
+    # Changed inputs, eager and CUDA graph replay, cold and delayed; aligned and unaligned BF16 D128.
+    for offset in ((0, 0, 0), (1, 0, 3)):
+        values, m, s, qm = make_inputs(256, 128, torch.bfloat16)
+        values = [placed(x, o) for x, o in zip(values, offset)]
+        for step in range(3):
+            for x in values:
+                x.copy_(torch.randn_like(x) * (1 + step))
+            assert_raw(*both(values, m, s, qm, 256), ("eager changed input", offset, step))
+        states = (VCScaleState(), VCScaleState())
+        graphs, captured = [], []
+        for library, state in zip((base, new), states):
+            with using(library):
+                run(values, m, s, qm, 256, state)
+                run(values, m, s, qm, 256, state)
+                torch.cuda.synchronize()
+                cold_graph, warm_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+                with torch.cuda.graph(cold_graph):
+                    cold = run(values, m, s, qm, 256)
+                with torch.cuda.graph(warm_graph):
+                    warm = run(values, m, s, qm, 256, state)
+                graphs.append((cold_graph, warm_graph))
+                captured.append((cold, warm, state))
+        for gain in (1.0, 1.0, 5.0, 1.0):
+            for x in values:
+                x.copy_(torch.randn_like(x) * gain)
+            snaps = []
+            for (cold_graph, warm_graph), (cold, warm, state) in zip(graphs, captured):
+                cold_graph.replay()
+                warm_graph.replay()
+                snaps.append(snapshot(cold, state)[:-6] + snapshot(warm, state))
+            assert_raw(*snaps, ("graph replay", offset, gain))
+    print("changed-input eager and graph replay raw-byte parity PASS", flush=True)
+
+    # Delayed histories from identically initialized states: warm same distribution, drift, shrink,
+    # alternating, exceptional values, back to normal.
+    configs = [
+        (256, 128, torch.bfloat16, (0, 0, 0), (1.5, 2.0)),
+        (256, 128, torch.bfloat16, (1, 1, 1), (1.5, 2.0)),
+        (128, 128, torch.bfloat16, (0, 2, 0), (1.0, 1.0)),
+        (128, 64, torch.bfloat16, (0, 0, 0), (1.5, 2.0)),
+        (256, 128, torch.float16, (0, 0, 0), (1.5, 2.0)),
+        (256, 128, torch.float32, (0, 1, 0), (1.5, 2.0)),
+    ]
+    for block, d, dtype, offset, margins in configs:
+        values, m, s, qm = make_inputs(block, d, dtype, 2, 3, metadata[block // 128 + d // 64])
+        history = [values] + [[torch.randn_like(x) for x in values] for _ in range(3)]
+        history += [
+            [x * 4 for x in values],
+            [x * 0.25 for x in values],
+            [x * 8 for x in values],
+            values,
+        ]
+        history += [
+            [special(x, "finite") for x in values],
+            [special(x, "nonfinite") for x in values],
+            values,
+        ]
+        inputs = [placed(x, o) for x, o in zip(values, offset)]
+        states = (VCScaleState(*margins), VCScaleState(*margins))
+        fallbacks = []
+        for step, h in enumerate(history):
+            for x, y in zip(inputs, h):
+                x.copy_(y)
+            a, b = both(inputs, m, s, qm, block, states=states)
+            assert_raw(a, b, ("delayed", block, d, dtype, offset, step))
+            fallbacks.append(int(dict(b)["state.fallbacks"]))
+        increments = [y - x for x, y in zip(fallbacks[:-1], fallbacks[1:])]
+        assert max(increments) > 0 and (margins == (1.0, 1.0) or 0 in increments[:3]), (
+            block,
+            d,
+            fallbacks,
+        )
+    print("delayed warm/drift/fallback history raw-byte parity PASS", flush=True)
+
+
 if __name__ == "__main__":
     test_vsa_preparation()
     test_vsa_delayed_state()
+    test_vsa_stats_grouped_loads_raw_bytes()
