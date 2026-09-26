@@ -666,7 +666,26 @@ def test_full_inner_hwmax_exact():
             ref = run()
             utils._fa_vc_full_inner_hwmax_enabled = True
             assert all(torch.equal(a, b) for a, b in zip(captured, ref)), sizes2
-        print("PASS full-inner hwmax: exact out/LSE across full/masked/empty, Q/K edges, graph replay", flush=True)
+        # NaN-poisoned K payload (E4M3FN has no inf encoding): unsupported input, but the opt-in must
+        # match the software path bit for bit (NaN positions included) so behavior equals baseline.
+        sizes = [128] * 10
+        aux.copy_(torch.tensor(sizes, device="cuda", dtype=torch.int32))
+        for dst, src in zip((mc, mi, fc, fi), lists(sizes, sq, patterns["a"])):
+            dst.copy_(src)
+        q, k, v = payload("random", sq, sk)
+        results_clean = [t.clone() for t in run()]
+        k.view(torch.uint8)[0, 300, 0, 5] = 0x7F  # inner full tile of head 0
+        k.view(torch.uint8)[0, 1000:1003, 1, :] = 0xFF  # whole rows, head 1
+        results = []
+        for flag in (False, True):
+            utils._fa_vc_full_inner_hwmax_enabled = flag
+            results.append([t.clone() for t in run()])
+        (out0, lse0), (out1, lse1) = results
+        print("NaN poison: baseline out NaNs", out0.float().isnan().sum().item(), "LSE NaNs", lse0.isnan().sum().item(),
+              "changed vs clean", not torch.equal(out0, results_clean[0]), flush=True)
+        for a, b in ((out0.float(), out1.float()), (lse0, lse1)):
+            assert torch.equal(a.isnan(), b.isnan()) and torch.equal(a.nan_to_num(), b.nan_to_num())
+        print("PASS full-inner hwmax: exact out/LSE across full/masked/empty, Q/K edges, graph replay, NaN poison", flush=True)
     finally:
         interface.FlashAttentionForwardSm100 = original_kernel
         interface._flash_attn_fwd.compile_cache = original_cache
