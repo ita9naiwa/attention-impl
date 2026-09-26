@@ -74,14 +74,10 @@ def _library(device_index):
             "quantize",
             "fused_stats",
             "fused_quantize",
-            "fused_quantize_stats",
-            "delayed_check",
-            "fallback_quantize",
         ),
     )
     driver.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-    for name in ("fused_stats", "fused_quantize_stats"):
-        _check(driver.cuFuncSetAttribute(functions[name], 8, 36864), "cuFuncSetAttribute")
+    _check(driver.cuFuncSetAttribute(functions["fused_stats"], 8, 36864), "cuFuncSetAttribute")
     return driver, module, functions
 
 
@@ -130,8 +126,6 @@ def _launch(name, grid, threads, pointers, integers, stream, wide_last=False):
             1,
             ((32 if integers[1] == 128 else 128) + 16) * integers[1] * 4
             if name == "fused_stats"
-            else ((32 if integers[1] == 128 else 128) + 16) * integers[1] * 4
-            if name == "fused_quantize_stats"
             else 0,
             stream,
             args,
@@ -174,69 +168,6 @@ def _rotate_qk(q, k, bshd=False):
     return oq, ok
 
 
-# prepare() compiles its margins into vc_preprocess.cu (QK_MARGIN / V_MARGIN): powers of two, so warm codes stay on
-# the cold E4M3 grid. prepare_vsa() passes the state's margins to its kernels at run time (default 1.5 / 2.0).
-PREPARE_MARGINS = (2.0, 2.0)
-PREPARE_VSA_MARGINS = (1.5, 2.0)
-
-
-class VCScaleState:
-    """Caller-owned delayed-scaling state for prepare() and prepare_vsa(): one per attention layer instance, entry
-    point and stream (head/CFG).
-
-    Opt-in: used only when passed as scale_state. Holds the previous call's {kmean, qs, ks, vs} (scales and
-    statistics only, never payload) in device buffers updated in place, plus int32 device counters. With a matching
-    state, the entry point quantizes in one pass with the previous scales times margins (qk_margin for Q/K,
-    v_margin for V) while recomputing this call's statistics, then re-quantizes on the device, with fresh scales,
-    every (b,h) whose fresh range the used scales do not cover or that shrank by more than 2x (no host
-    synchronization). An empty or mismatched state (the signature includes the entry point's shapes) takes the
-    unchanged cold path and (re)initializes. Returned descales are the ones actually used. Sharing one state across
-    differently distributed inputs only causes fallbacks.
-
-    Margins default (None) to the entry point's own: PREPARE_MARGINS for prepare(), which accepts only those
-    (compiled), and PREPARE_VSA_MARGINS for prepare_vsa(), which accepts any.
-    Unset margins stay None on the object (qk_margin/v_margin); margins(default) returns the resolved pair.
-    """
-
-    def __init__(self, qk_margin=None, v_margin=None):
-        self.signature = None
-        self.qk_margin = None if qk_margin is None else float(qk_margin)
-        self.v_margin = None if v_margin is None else float(v_margin)
-        self.fallbacks = None  # int32 device counter: (b,h) re-quantized with fresh scales
-        # int32 device counter: (block, channel, tensor) slabs over E4M3 range in attempted warm-path stores
-        # (prepare_vsa: including padded K slots and heads later overwritten by a fallback).
-        self.saturations = None
-
-    def margins(self, default):
-        """(qk_margin, v_margin), each unset one taken from the entry point's default pair."""
-        return tuple(
-            d if m is None else m for m, d in zip((self.qk_margin, self.v_margin), default)
-        )
-
-    def _init(self, signature, kmean, qs, ks, vs):
-        fresh = (kmean, qs, ks, vs)
-        old = (self.kmean, self.qs, self.ks, self.vs) if self.signature is not None else ()
-        # Reuse in place (graph-safe pointers) only if every buffer matches: kmean/vs depend on D, not only on
-        # (B, H), and a dtype change must not be silently cast by copy_.
-        if old and all(
-            (dst.shape, dst.device, dst.dtype) == (src.shape, src.device, src.dtype)
-            for dst, src in zip(old, fresh)
-        ):
-            for dst, src in zip(old, fresh):
-                dst.copy_(src)
-        else:
-            self.kmean, self.qs, self.ks, self.vs = (
-                kmean.clone(),
-                qs.clone(),
-                ks.clone(),
-                vs.clone(),
-            )
-        self.signature = signature
-        if self.fallbacks is None or self.fallbacks.device != qs.device:
-            self.fallbacks = torch.zeros((), device=qs.device, dtype=torch.int32)
-            self.saturations = torch.zeros((), device=qs.device, dtype=torch.int32)
-
-
 @torch.no_grad()
 def prepare(
     q,
@@ -247,7 +178,6 @@ def prepare(
     hadamard=True,
     mean_dtype=torch.bfloat16,
     bshd=False,
-    scale_state=None,
 ):
     """Prepare finite contiguous CUDA BHND or BSHD inputs; permutation must be a bijection.
 
@@ -284,31 +214,6 @@ def prepare(
     outputs = [
         torch.empty((b, n, h, d), device=q.device, dtype=torch.float8_e4m3fn) for _ in range(3)
     ]
-    delayed = scale_state is not None and fused
-    if delayed and scale_state.margins(PREPARE_MARGINS) != PREPARE_MARGINS:
-        raise ValueError(f"prepare() delayed scaling uses the compiled margins {PREPARE_MARGINS}")
-    signature = (q.device, q.dtype, b, h, n, d, bshd)
-    if delayed and scale_state.signature == signature:
-        return _prepare_delayed(
-            q,
-            k,
-            v,
-            scale_state,
-            stats,
-            means,
-            kmean,
-            qs,
-            ks,
-            vs,
-            outputs,
-            b,
-            h,
-            n,
-            d,
-            nb,
-            bshd,
-            mean_dtype,
-        )
     with torch.cuda.device(q.device):
         stream = torch.cuda.current_stream(q.device).cuda_stream
         dtype = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[q.dtype]
@@ -364,8 +269,6 @@ def prepare(
             stream,
             wide_last=True,
         )
-    if delayed:
-        scale_state._init(signature, kmean, qs, ks, vs)
     return {
         "q": outputs[0],
         "k": outputs[1],
@@ -373,85 +276,6 @@ def prepare(
         "qs": qs,
         "ks": ks,
         "vs": vs,
-        "means": means,
-    }
-
-
-def _prepare_delayed(
-    q, k, v, state, stats, means, kmean, qs, ks, vs, outputs, b, h, n, d, nb, bshd, mean_dtype
-):
-    """Steady state: fused_quantize_stats -> reduce_stats (fresh) -> delayed_check -> fallback_quantize (flagged heads)."""
-    factory = {"device": q.device, "dtype": torch.float32}
-    used_qs, used_ks = torch.empty((b, h), **factory), torch.empty((b, h), **factory)
-    used_vs = torch.empty((b, h, d), **factory)
-    flag = torch.empty((b, h), device=q.device, dtype=torch.int32)
-    with torch.cuda.device(q.device):
-        stream = torch.cuda.current_stream(q.device).cuda_stream
-        dtype = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[q.dtype]
-        _launch(
-            "fused_quantize_stats",
-            b * h * nb,
-            256,
-            [
-                q,
-                k,
-                v,
-                stats,
-                state.kmean,
-                state.qs,
-                state.ks,
-                state.vs,
-                *outputs,
-                state.saturations,
-            ],
-            [n, d, nb, h, dtype, int(bshd)],
-            stream,
-        )
-        _launch(
-            "reduce_stats",
-            b * h,
-            128 if nb == 1 else 1024,
-            [stats, means, kmean, qs, ks, vs],
-            [n, d, nb, int(mean_dtype == torch.float32)],
-            stream,
-        )
-        _launch(
-            "delayed_check",
-            b * h,
-            d,
-            [
-                state.kmean,
-                state.qs,
-                state.ks,
-                state.vs,
-                kmean,
-                qs,
-                ks,
-                vs,
-                flag,
-                used_qs,
-                used_ks,
-                used_vs,
-                state.fallbacks,
-            ],
-            [d],
-            stream,
-        )
-        _launch(
-            "fallback_quantize",
-            b * h * nb,
-            256,
-            [q, k, v, flag, kmean, qs, ks, vs, *outputs],
-            [n, d, nb, h, dtype, int(bshd)],
-            stream,
-        )
-    return {
-        "q": outputs[0],
-        "k": outputs[1],
-        "v": outputs[2],
-        "qs": used_qs,
-        "ks": used_ks,
-        "vs": used_vs,
         "means": means,
     }
 

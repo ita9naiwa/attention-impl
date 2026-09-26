@@ -2,11 +2,6 @@
 typedef long long int64_t;
 typedef unsigned char uint8_t;
 #define INFINITY __int_as_float(0x7f800000)
-// Delayed-scaling headroom over the previous call's scales. E4M3 is floating point: a margin only moves values
-// toward the subnormal tail, so generous margins are nearly free while saturation is not. Powers of two only shift the
-// E4M3 exponent: with unchanged statistics the dequantized values equal the cold pass (normal range).
-#define QK_MARGIN 2.0f
-#define V_MARGIN 2.0f
 
 __device__ float read_input(const void *p, int64_t i, int dtype) {
     if (dtype == 0) return __uint_as_float(((unsigned int)((const unsigned short*)p)[i]) << 16);
@@ -249,12 +244,8 @@ template<int D, bool SignedFma=false> __device__ void rotate_contiguous(float (&
 
 __device__ unsigned short to_fp8_two(float x0,float x1){unsigned short out;asm("cvt.rn.satfinite.e4m3x2.f32 %0,%2,%1;":"=h"(out):"f"(x0),"f"(x1));return out;}
 // Reuse D128 slabs while retaining ascending global row order for K additions.
-// QUANT (delayed scaling): also store E4M3 Q/K/V quantized with the caller's previous-call scales times
-// headroom margins; the stats slabs are computed by the identical code path as fused_stats.
-template<int D,bool QUANT=false> __device__ void fused_stats_impl(const void *q,const void *k,const void *v,float *stats,
-    int n,int nb,int h,int dtype,bool bshd,float scale,const float *pkmean=nullptr,const float *pqs=nullptr,
-    const float *pks=nullptr,const float *pvs=nullptr,uint8_t *oq=nullptr,uint8_t *ok=nullptr,uint8_t *ov=nullptr,
-    int *saturated=nullptr){
+template<int D> __device__ void fused_stats_impl(const void *q,const void *k,const void *v,float *stats,
+    int n,int nb,int h,int dtype,bool bshd,float scale){
     constexpr int W=D/32,ROWS=D==128?32:128;int bh=blockIdx.x/nb,block=blockIdx.x%nb;
     int lane=threadIdx.x%32,warp=threadIdx.x/32,start=block*128,count=min(128,n-start);
     extern __shared__ float sm[];float *keys=sm,*qm=sm+ROWS*D,*vm=qm+8*D;
@@ -283,24 +274,6 @@ template<int D,bool QUANT=false> __device__ void fused_stats_impl(const void *q,
             rotate_contiguous<D>(qr,kr,scale);
             #pragma unroll
             for(int j=0;j<W;++j){keys[local*D+lane*W+j]=kr[j];qmax[j]=fmaxf(qmax[j],fabsf(qr[j]));}
-            if constexpr(QUANT){
-                if(row<count){
-                    int head=bh%h,batch=bh/h,c=lane*W;
-                    int64_t dst=(((int64_t)batch*n+start+row)*h+head)*D+c;
-                    float uq=pqs[bh]*QK_MARGIN,uk=pks[bh]*QK_MARGIN,oqv[W],okv[W],ovv[W];
-                    #pragma unroll
-                    for(int j=0;j<W;++j){oqv[j]=qr[j]/uq;okv[j]=(kr[j]-pkmean[bh*D+c+j])/uk;ovv[j]=vr[j]/(pvs[bh*D+c+j]*V_MARGIN);}
-                    if constexpr(D==128){
-                        *(unsigned int*)(oq+dst)=to_fp8_four(oqv[0],oqv[1],oqv[2],oqv[3]);
-                        *(unsigned int*)(ok+dst)=to_fp8_four(okv[0],okv[1],okv[2],okv[3]);
-                        *(unsigned int*)(ov+dst)=to_fp8_four(ovv[0],ovv[1],ovv[2],ovv[3]);
-                    }else{
-                        *(unsigned short*)(oq+dst)=to_fp8_two(oqv[0],oqv[1]);
-                        *(unsigned short*)(ok+dst)=to_fp8_two(okv[0],okv[1]);
-                        *(unsigned short*)(ov+dst)=to_fp8_two(ovv[0],ovv[1]);
-                    }
-                }
-            }
         }
         if(slab+ROWS==128){
             #pragma unroll
@@ -320,12 +293,6 @@ template<int D,bool QUANT=false> __device__ void fused_stats_impl(const void *q,
         for(int w=1;w<8;++w){aq=fmaxf(aq,qm[w*D+c]);av=fmaxf(av,vm[w*D+c]);}
         int64_t s=((int64_t)bh*nb+block)*6*D+c;
         stats[s]=sk;stats[s+D]=lo;stats[s+2*D]=hi;stats[s+3*D]=aq;stats[s+4*D]=av;stats[s+5*D]=0;
-        if constexpr(QUANT){  // saturation counter from the block maxima: (block, channel, tensor) slabs over 448 x scale
-            float km=pkmean[bh*D+c];
-            int over=(aq>448.f*pqs[bh]*QK_MARGIN)+(av>448.f*pvs[bh*D+c]*V_MARGIN)
-                    +(fmaxf(fabsf(lo-km),fabsf(hi-km))>448.f*pks[bh]*QK_MARGIN);
-            if(over)atomicAdd(saturated,over);
-        }
     }
 }
 extern "C" __global__ __launch_bounds__(256, 6) void fused_stats(const void *q,const void *k,const void *v,
@@ -365,76 +332,4 @@ extern "C" __global__ void fused_quantize(const void *q,const void *k,const void
     float scale=rsqrtf((float)d);
     if(d==64)fused_quant_impl<64>(q,k,v,kmean,qs,ks,vs,oq,ok,ov,n,h,qkdtype,qk_bshd,scale);
     else fused_quant_impl<128>(q,k,v,kmean,qs,ks,vs,oq,ok,ov,n,h,qkdtype,qk_bshd,scale);
-}
-
-// Delayed scaling, steady state: one pass writes FP8 with the previous-call scales and this call's stats slabs;
-// counts (block, channel, tensor) slabs that saturate E4M3 (their heads are re-quantized by fallback_quantize).
-extern "C" __global__ __launch_bounds__(256, 6) void fused_quantize_stats(const void *q,const void *k,const void *v,
- float *stats,const float *pkmean,const float *pqs,const float *pks,const float *pvs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
- int *saturated,int n,int d,int nb,int h,int dtype,bool bshd){
-    float scale=rsqrtf((float)d);
-    if(d==64)fused_stats_impl<64,true>(q,k,v,stats,n,nb,h,dtype,bshd,scale,pkmean,pqs,pks,pvs,oq,ok,ov,saturated);
-    else fused_stats_impl<128,true>(q,k,v,stats,n,nb,h,dtype,bshd,scale,pkmean,pqs,pks,pvs,oq,ok,ov,saturated);
-}
-
-// Per (b,h): the used scales (previous * margin) must cover this call's ranges (no E4M3 saturation; K bound via
-// |k-kmean_prev| <= |k-kmean_fresh| + |kmean_fresh-kmean_prev|) and not exceed 2x the steady-state ratio (used <= 2*margin*fresh).
-// Otherwise flag the head for fresh re-quantization. Writes the descales actually used, then state <- fresh.
-extern "C" __global__ void delayed_check(float *pkmean,float *pqs,float *pks,float *pvs,const float *fkmean,
- const float *fqs,const float *fks,const float *fvs,int *flag,float *oqs,float *oks,float *ovs,int *fallbacks,int d){
-    int bh=blockIdx.x,c=threadIdx.x;__shared__ int bad;__shared__ float shift[128];
-    if(c==0)bad=0;
-    __syncthreads();
-    float uv=pvs[bh*d+c]*V_MARGIN,fv=fvs[bh*d+c];
-    shift[c]=fabsf(fkmean[bh*d+c]-pkmean[bh*d+c]);
-    if(fv>uv||uv>2.f*V_MARGIN*fv)atomicOr(&bad,1);
-    __syncthreads();
-    if(c==0){
-        float ms=0;for(int j=0;j<d;++j)ms=fmaxf(ms,shift[j]);
-        float uq=pqs[bh]*QK_MARGIN,uk=pks[bh]*QK_MARGIN,kneed=fks[bh]+ms/448.f;
-        if(fqs[bh]>uq||uq>2.f*QK_MARGIN*fqs[bh]||kneed>uk||uk>2.f*QK_MARGIN*fks[bh])bad=1;
-        flag[bh]=bad;if(bad)atomicAdd(fallbacks,1);
-        oqs[bh]=bad?fqs[bh]:uq;oks[bh]=bad?fks[bh]:uk;
-    }
-    __syncthreads();
-    ovs[bh*d+c]=bad?fv:uv;
-    __syncthreads();
-    pvs[bh*d+c]=fv;pkmean[bh*d+c]=fkmean[bh*d+c];
-    if(c==0){pqs[bh]=fqs[bh];pks[bh]=fks[bh];}
-}
-
-// Fallback: fresh re-quantization of flagged heads only, identical per-element math to fused_quantize.
-// 128 tokens per CTA (grid b*h*nb); unflagged heads exit immediately.
-template<int D> __device__ void fallback_impl(const void *q,const void *k,const void *v,const int *flag,
- const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
- int n,int nb,int h,int dtype,bool bshd,float scale){
-    constexpr int W=D/32;int bh=blockIdx.x/nb,block=blockIdx.x%nb;
-    if(!flag[bh])return;
-    int lane=threadIdx.x%32,warp=threadIdx.x/32,head=bh%h,batch=bh/h,c=lane*W;
-    for(int t=block*128+warp;t<min(n,block*128+128);t+=8){
-        int64_t dst=(((int64_t)batch*n+t)*h+head)*D+c,src=bshd?dst:((int64_t)bh*n+t)*D+c;
-        float qr[W],kr[W],vr[W];
-        read_contiguous<D>(q,src,dtype,qr);
-        read_contiguous<D>(k,src,dtype,kr);
-        read_contiguous<D>(v,src,dtype,vr);
-        rotate_contiguous<D>(qr,kr,scale);
-        #pragma unroll
-        for(int j=0;j<W;++j){qr[j]/=qs[bh];kr[j]=(kr[j]-kmean[bh*D+c+j])/ks[bh];vr[j]/=vs[bh*D+c+j];}
-        if constexpr(D==128){
-            *(unsigned int*)(oq+dst)=to_fp8_four(qr[0],qr[1],qr[2],qr[3]);
-            *(unsigned int*)(ok+dst)=to_fp8_four(kr[0],kr[1],kr[2],kr[3]);
-            *(unsigned int*)(ov+dst)=to_fp8_four(vr[0],vr[1],vr[2],vr[3]);
-        }else{
-            *(unsigned short*)(oq+dst)=to_fp8_two(qr[0],qr[1]);
-            *(unsigned short*)(ok+dst)=to_fp8_two(kr[0],kr[1]);
-            *(unsigned short*)(ov+dst)=to_fp8_two(vr[0],vr[1]);
-        }
-    }
-}
-extern "C" __global__ void fallback_quantize(const void *q,const void *k,const void *v,const int *flag,
- const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
- int n,int d,int nb,int h,int dtype,bool bshd){
-    float scale=rsqrtf((float)d);
-    if(d==64)fallback_impl<64>(q,k,v,flag,kmean,qs,ks,vs,oq,ok,ov,n,nb,h,dtype,bshd,scale);
-    else fallback_impl<128>(q,k,v,flag,kmean,qs,ks,vs,oq,ok,ov,n,nb,h,dtype,bshd,scale);
 }
