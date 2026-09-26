@@ -34,6 +34,51 @@ def test_fused_stats_preserve_row_order():
                 ), (d, n, key)
 
 
+def _exceptional(kind, shape, dtype, g):
+    info = torch.finfo(dtype)
+    x = torch.randn(shape, generator=g)
+    if kind == "large":  # finite inputs whose Hadamard sums overflow
+        x = x.sign() * info.max / (1 + 3 * torch.rand(shape, generator=g))
+    elif kind == "zeros":
+        x = torch.where(
+            torch.rand(shape, generator=g) < 0.5, torch.tensor(0.0), torch.tensor(-0.0)
+        )
+    elif kind == "subnormal":
+        x = x * info.smallest_normal * 0.25
+    elif kind == "spikes":
+        x = torch.where(
+            torch.rand(shape, generator=g) < 1e-3, x.sign() * info.max / 2, x
+        )
+    x = x.to(dtype)
+    if kind == "nonfinite":
+        flat = x.view(-1)
+        for n, i in enumerate(torch.randperm(flat.numel(), generator=g)[:24].tolist()):
+            flat[i] = (float("nan"), float("inf"), float("-inf"))[n % 3]
+    return x.cuda()
+
+
+@torch.no_grad()
+def test_fused_quantizer_exceptional_inputs_match_unfused():
+    # The fused quantizer's butterflies (signed-unit FMA) must round exactly like the separate
+    # rotation's add/sub, including overflow to Inf/NaN, signed zeros and subnormals.
+    g = torch.Generator().manual_seed(7)
+    for kind in ("randn", "large", "zeros", "subnormal", "spikes", "nonfinite"):
+        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+            for d in (64, 128):
+                for bshd in (False, True):
+                    shape = (2, 300, 3, d) if bshd else (2, 3, 300, d)
+                    q, k, v = (_exceptional(kind, shape, dtype, g) for _ in range(3))
+                    rq, rk = _rotate_qk(q, k, bshd=bshd)  # always BHND
+                    vv = (v.transpose(1, 2) if bshd else v).float().contiguous()
+                    expected = prepare(rq, rk, vv, smooth=False, hadamard=False)
+                    actual = prepare(q, k, v, smooth=False, bshd=bshd)
+                    for key in expected:
+                        assert torch.equal(
+                            actual[key].view(torch.uint8),
+                            expected[key].view(torch.uint8),
+                        ), (kind, dtype, d, bshd, key)
+
+
 @torch.no_grad()
 def test_preprocess_layout():
     torch.manual_seed(42)
