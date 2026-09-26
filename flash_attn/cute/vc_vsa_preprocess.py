@@ -99,7 +99,12 @@ class VCScaleState:
             for dst, src in zip((self.kmean, self.qs, self.ks, self.vs), (kmean, qs, ks, vs)):
                 dst.copy_(src)
         else:
-            self.kmean, self.qs, self.ks, self.vs = kmean.clone(), qs.clone(), ks.clone(), vs.clone()
+            self.kmean, self.qs, self.ks, self.vs = (
+                kmean.clone(),
+                qs.clone(),
+                ks.clone(),
+                vs.clone(),
+            )
         self.signature = signature
         if self.fallbacks is None or self.fallbacks.device != qs.device:
             self.fallbacks = torch.zeros((), device=qs.device, dtype=torch.int32)
@@ -198,18 +203,65 @@ def prepare_vsa(
                 "vsa_stats_delayed",
                 (blocks, h, b),
                 256,
-                [q, k, v, padded_to_original, padded_to_query, variable_block_sizes, stats, *pools,
-                 st.kmean, st.qs, st.ks, st.vs, oq, ok, ov, st.saturations],
-                [source_n, blocks, h, d, block_size, query_tokens, query_offset, dtype, metadata_mask],
+                [
+                    q,
+                    k,
+                    v,
+                    padded_to_original,
+                    padded_to_query,
+                    variable_block_sizes,
+                    stats,
+                    *pools,
+                    st.kmean,
+                    st.qs,
+                    st.ks,
+                    st.vs,
+                    oq,
+                    ok,
+                    ov,
+                    st.saturations,
+                ],
+                [
+                    source_n,
+                    blocks,
+                    h,
+                    d,
+                    block_size,
+                    query_tokens,
+                    query_offset,
+                    dtype,
+                    metadata_mask,
+                ],
                 stream,
                 margins,
             )
-            _launch("vsa_reduce", (b * h, 1, 1), 1024, [stats, kmean, qs, ks, vs], [padded_n, d, blocks], stream)
+            _launch(
+                "vsa_reduce",
+                (b * h, 1, 1),
+                1024,
+                [stats, kmean, qs, ks, vs],
+                [padded_n, d, blocks],
+                stream,
+            )
             _launch(
                 "vsa_check",
                 (b * h, 1, 1),
                 d,
-                [st.kmean, st.qs, st.ks, st.vs, kmean, qs, ks, vs, flag, used_qs, used_ks, used_vs, st.fallbacks],
+                [
+                    st.kmean,
+                    st.qs,
+                    st.ks,
+                    st.vs,
+                    kmean,
+                    qs,
+                    ks,
+                    vs,
+                    flag,
+                    used_qs,
+                    used_ks,
+                    used_vs,
+                    st.fallbacks,
+                ],
                 [d],
                 stream,
                 margins,
