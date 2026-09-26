@@ -301,7 +301,7 @@ template<int D> __device__ void fused_quant_impl(const void *q,const void *k,con
     constexpr int W=D/32;int lane=threadIdx.x%32,t=blockIdx.x*8+threadIdx.x/32;
     if(t>=n)return;
     int head=blockIdx.y,batch=blockIdx.z,bh=batch*h+head,c=lane*W;
-    int64_t src=input_index(bh,t,c,n,h,D,bshd),dst=(((int64_t)batch*n+t)*h+head)*D+c;
+    int64_t dst=(((int64_t)batch*n+t)*h+head)*D+c,src=bshd?dst:((int64_t)bh*n+t)*D+c;
     float qr[W],kr[W],vr[W];
     read_contiguous<D>(q,src,dtype,qr);
     read_contiguous<D>(k,src,dtype,kr);
