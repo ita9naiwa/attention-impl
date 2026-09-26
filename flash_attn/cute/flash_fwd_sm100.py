@@ -3317,8 +3317,12 @@ class FlashAttentionForwardSm100:
                             # Notify mma warp that O has been rescaled
                             if const_expr(self.vc_tc):
                                 pipeline_sm_stats.consumer_release_w_index(stage)
+                            # Stats overlap skips intermediate stats acquires, so the final drain's parity
+                            # wait cannot tell n from n-2 acks; ack before O gates the final sum (n-1 minimum).
+                            if const_expr(self.vc_sparse_stats_overlap):
+                                pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
                             pipeline_s_p_o.consumer_release_w_index(stage)
-                            if const_expr(not self.vc_tc):
+                            if const_expr(not self.vc_tc and not self.vc_sparse_stats_overlap):
                                 pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
                         sm_stats_consumer_phase ^= 1
                         # o_corr_consumer_phase ^= 1
