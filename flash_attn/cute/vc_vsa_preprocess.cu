@@ -1,5 +1,40 @@
 #include "vc_preprocess.cu"
 
+// Stats D128: BF16 with all three addresses 8B-aligned issues the Q/K/V uint2 loads before any unpack
+// (same bits as read_contiguous); anything else uses read_contiguous per input.
+template<int D> __device__ __forceinline__ void read_qkv_contiguous(
+    const void *q, const void *k, const void *v, int64_t i, int dtype,
+    float *rawq, float *rawk, float *rawv) {
+    if constexpr(D==128) {
+        if(dtype==0) {
+            const unsigned short *qa=((const unsigned short*)q)+i;
+            const unsigned short *ka=((const unsigned short*)k)+i;
+            const unsigned short *va=((const unsigned short*)v)+i;
+            if(((((unsigned long long)qa)|((unsigned long long)ka)|((unsigned long long)va))&7)==0) {
+                uint2 qb=*((const uint2*)qa);
+                uint2 kb=*((const uint2*)ka);
+                uint2 vb=*((const uint2*)va);
+                rawq[0]=__uint_as_float(qb.x<<16);
+                rawq[1]=__uint_as_float(qb.x&0xffff0000u);
+                rawq[2]=__uint_as_float(qb.y<<16);
+                rawq[3]=__uint_as_float(qb.y&0xffff0000u);
+                rawk[0]=__uint_as_float(kb.x<<16);
+                rawk[1]=__uint_as_float(kb.x&0xffff0000u);
+                rawk[2]=__uint_as_float(kb.y<<16);
+                rawk[3]=__uint_as_float(kb.y&0xffff0000u);
+                rawv[0]=__uint_as_float(vb.x<<16);
+                rawv[1]=__uint_as_float(vb.x&0xffff0000u);
+                rawv[2]=__uint_as_float(vb.y<<16);
+                rawv[3]=__uint_as_float(vb.y&0xffff0000u);
+                return;
+            }
+        }
+    }
+    read_contiguous<D>(q,i,dtype,rawq);
+    read_contiguous<D>(k,i,dtype,rawk);
+    read_contiguous<D>(v,i,dtype,rawv);
+}
+
 __device__ int64_t vsa_index(const void *p, int i, bool wide) {
     return wide ? ((const int64_t*)p)[i] : ((const int*)p)[i];
 }
@@ -34,9 +69,7 @@ template<int D, bool DELAYED=false> __device__ void vsa_stats_impl(
         if constexpr(D==128){
             float rawq[W], rawk[W], rawv[W];
             if(valid){
-                read_contiguous<D>(q,base+lane*W,dtype,rawq);
-                read_contiguous<D>(k,base+lane*W,dtype,rawk);
-                read_contiguous<D>(v,base+lane*W,dtype,rawv);
+                read_qkv_contiguous<D>(q,k,v,base+lane*W,dtype,rawq,rawk,rawv);
             }else{
                 #pragma unroll
                 for(int j=0;j<W;++j){rawq[j]=0;rawk[j]=0;rawv[j]=0;}
