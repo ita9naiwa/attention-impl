@@ -95,7 +95,7 @@ def _inputs(tiles, heads, seed=0):
     return q, k, v
 
 
-def _fwd(q, k, v, lists, masked, enabled):
+def _fwd(q, k, v, lists, masked, enabled, aux=None):
     mask_cnt, mask_idx, full_cnt, full_idx = lists
     sparse = BlockSparseTensorsTorch(
         mask_block_cnt=mask_cnt,
@@ -114,7 +114,7 @@ def _fwd(q, k, v, lists, masked, enabled):
             tile_mn=(TILE, TILE),
             pack_gqa=False,
             mask_mod=cute_ima_mask if masked else None,
-            aux_tensors=_aux(q.device) if masked else None,
+            aux_tensors=(aux or _aux(q.device)) if masked else None,
             block_sparse_tensors=sparse,
             return_lse=True,
         )[:2]
@@ -137,8 +137,11 @@ def _reference(q, k, v, spec, masked):
     return torch.einsum("bhqk,bkhd->bqhd", p, v.float()), lse
 
 
-def _compare(spec, on, off):
-    """count <= 1 tiles bit-exact (E3); the rest within the E4 merge-rounding tolerances."""
+def _compare(spec, on, off, ref):
+    """count <= 1 tiles bit-exact (E3). Longer lists (E4): the merge only reorders FP32 sums, so
+    O may move by bf16 output rounding (observed <= 3 ulps; checked at 4), must be no less accurate than
+    the one-stream kernel against the fp32 reference, and LSE matches to 1e-4. (The planned
+    avg|dO| < 1e-4 is below the one-stream kernel's own bf16 noise: debug/d2.log.)"""
     (out_on, lse_on), (out_off, lse_off) = on, off
     assert torch.isfinite(out_on).all() and not torch.isnan(lse_on).any()
     multi = []
@@ -154,9 +157,14 @@ def _compare(spec, on, off):
     rows = torch.cat([torch.arange(m * TILE, (m + 1) * TILE) for m in multi]).cuda()
     o_on, o_off = out_on[:, rows].float(), out_off[:, rows].float()
     l_on, l_off = lse_on[..., rows], lse_off[..., rows]
-    diff = (o_on - o_off).abs()
-    assert diff.mean() < 1e-4, diff.mean()
-    assert diff.max() / (o_off.abs().mean() + 1e-6) < 0.02, diff.max()
+    # 4 bf16 ulps of the element, floored at 4 ulps of the mean |O| (near-zero outputs come from
+    # cancellation, so their rounding error scales with the accumulated terms, not with |O|).
+    eps4 = 4 * torch.finfo(torch.bfloat16).eps
+    tol = eps4 * torch.maximum(torch.maximum(o_on.abs(), o_off.abs()), o_off.abs().mean())
+    assert ((o_on - o_off).abs() <= tol).all(), ((o_on - o_off).abs() - tol).max()
+    o_ref = ref[:, rows]
+    err_on, err_off = (o_on - o_ref).abs(), (o_off - o_ref).abs()
+    assert err_on.mean() <= 1.1 * err_off.mean() + 1e-7, (err_on.mean(), err_off.mean())
     assert torch.equal(torch.isinf(l_on), torch.isinf(l_off))
     finite = torch.isfinite(l_off)
     if finite.any():
@@ -172,8 +180,8 @@ def test_kv_pingpong_matches_one_stream(case, masked):
     lists = _lists(spec, heads)
     on = _fwd(q, k, v, lists, masked, True)
     off = _fwd(q, k, v, lists, masked, False)
-    _compare(spec, on, off)
     out_ref, lse_ref = _reference(q, k, v, spec, masked)
+    _compare(spec, on, off, out_ref)
     assert (on[0].float() - out_ref).abs().max() < 2e-2
     assert torch.equal(torch.isinf(on[1]), torch.isinf(lse_ref))
     finite = torch.isfinite(lse_ref)
@@ -208,7 +216,8 @@ def test_graph_replay_matches_eager():
     heads = 2
     q, k, v = _inputs(3, heads)
     lists = _lists(specs[0], heads)
-    run = lambda: _fwd(q, k, v, lists, True, True)  # noqa: E731
+    aux = _aux(q.device)  # built outside capture (host->device copy)
+    run = lambda: _fwd(q, k, v, lists, True, True, aux)  # noqa: E731
     run()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
