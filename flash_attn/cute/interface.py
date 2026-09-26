@@ -598,6 +598,7 @@ def _flash_attn_fwd(
     vc_mean: Optional[torch.Tensor] = None,
     vc_vscale: Optional[torch.Tensor] = None,
     vc_vbs128: bool = False,
+    alias_guard: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -608,6 +609,8 @@ def _flash_attn_fwd(
         block_sparse_tensors: A tuple of tensors used for block sparsity.
         vc_vbs128: Use the built-in physical-KV128 valid-count mask (aux[0] values in [0,128]).
             Requires fixed-length sparse QKV and mask_mod=None; enables compact VC when supported.
+        alias_guard: Persistent-grid alias guard hint for the block-sparse Q256 1-CTA static persistent forward.
+            None keeps the default (on for BF16, off for VC ExpCast); True/False force it on/off. Bit-exact either way.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
             The returned LSE supports taking gradient.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
@@ -1224,6 +1227,7 @@ def _flash_attn_fwd(
         not causal, not local, score_mod is None, learnable_sink is None,
     ))
     compile_key = (
+        alias_guard,
         vc_vbs128_eligible,
         vc_expcast,
         vc_nonpersistent,
@@ -1488,6 +1492,7 @@ def _flash_attn_fwd(
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
                 fa_fwd.vc_expcast = vc_expcast
+                fa_fwd.alias_guard_hint = alias_guard
                 if vc_expcast and use_block_sparsity and fa_fwd.is_sm103 and score_mod is None:
                     # Full sparse iterations use hardware max; masked iterations
                     # retain the post-mask software reduction in softmax_step.
@@ -3502,6 +3507,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        alias_guard: Optional[bool] = None,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3532,6 +3538,7 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            alias_guard=alias_guard,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
@@ -3578,9 +3585,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 token_chunk=ctx.gather_bwd_token_chunk,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 15)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 15)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3609,7 +3616,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 15)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3861,6 +3868,7 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    alias_guard: Optional[bool] = None,
 ):
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
@@ -3903,6 +3911,7 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        alias_guard,
     )
 
 

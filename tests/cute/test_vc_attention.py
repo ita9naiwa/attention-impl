@@ -692,6 +692,79 @@ def test_full_inner_hwmax_exact():
         utils._fa_vc_full_inner_hwmax_enabled = original_flag
 
 
+def test_alias_guard_hint_exact():
+    """alias_guard hint (None/True/False) on the block-sparse Q256 forward, BF16 and VC ExpCast: out/LSE bit-identical.
+
+    The guard only shrinks the persistent grid (148 -> 146 CTAs on B300) when the Q256 block count and the SM count divide
+    each other. None keeps the default (BF16 on, VC off); True/False force it. Q = 37/74/148 alias, Q = 150 is the control.
+    """
+    if torch.cuda.get_device_capability() != (10, 3):
+        print("SKIP alias guard hint: requires SM103")
+        return
+    import json, os
+    from torch.profiler import ProfilerActivity, profile
+    from flash_attn.cute import interface
+    from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+    sm = torch.cuda.get_device_properties(0).multi_processor_count
+    mask = _vbs_vector_mask()
+    heads, nk, prefix = 8, 6, 3  # heads x Q > 146 so the capped grid is reached; dense prefix rows as on H3
+    sk = nk * 128
+    aux = torch.tensor([128] * (nk - 1) + [77], device="cuda", dtype=torch.int32)
+    vc_args = dict(q_descale=torch.full((1, heads), 1e-3, device="cuda"), k_descale=torch.full((1, heads), 1e-3, device="cuda"),
+                   vc_vscale=torch.rand(1, heads, 128, device="cuda") + 0.5, vc_expcast=True)
+
+    def fwd_grid(fn):
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            fn()
+            torch.cuda.synchronize()
+        path = f"/tmp/alias-guard-hint-{os.getpid()}.json"
+        prof.export_chrome_trace(path)
+        events = json.load(open(path))["traceEvents"]
+        os.remove(path)
+        grids = {e["args"].get("grid", [0])[0] for e in events
+                 if e.get("cat") == "kernel" and "forward" in e["name"].lower()}
+        assert len(grids) == 1, grids
+        return grids.pop()
+
+    for vc in (False, True):
+        for q_blocks in (37, 74, 148, 150):
+            sq = q_blocks * 256
+            torch.manual_seed(q_blocks)
+            if vc:
+                q, k, v = [(torch.randn(1, n, heads, 128, device="cuda") * 120).clamp(-448, 448).to(torch.float8_e4m3fn)
+                           for n in (sq, sk, sk)]
+            else:
+                q, k, v = [torch.randn(1, n, heads, 128, device="cuda", dtype=torch.bfloat16) for n in (sq, sk, sk)]
+            selected = torch.rand(heads, q_blocks, nk, device="cuda") < 0.4
+            selected[:, :prefix] = True
+            order = torch.arange(nk, device="cuda", dtype=torch.int32).expand(heads, q_blocks, nk)
+
+            def packed(sel):
+                idx = torch.where(sel, order, nk).sort(-1).values
+                return sel.sum(-1, dtype=torch.int32)[None].contiguous(), idx.masked_fill(idx == nk, 0).to(torch.int32)[None].contiguous()
+
+            (mc, mi), (fc, fi) = packed(selected & (aux < 128) & (aux > 0)), packed(selected & (aux == 128))
+            sparse = BlockSparseTensorsTorch(mc, mi, fc, fi, block_size=(256, 128))
+            aliased = q_blocks % sm == 0 or sm % q_blocks == 0
+            results = {}
+            for hint in (None, True, False):
+                def run():
+                    return interface._flash_attn_fwd(
+                        q, k, v, tile_mn=(128, 128), max_seqlen_q=sq, mask_mod=mask, block_sparse_tensors=sparse,
+                        aux_tensors=[aux], return_lse=True, alias_guard=hint, **(vc_args if vc else {}),
+                    )[:2]
+                results[hint] = [t.clone() for t in run()]
+                engaged = aliased and (hint if hint is not None else not vc)
+                grid = fwd_grid(run)
+                assert grid == (sm - 2 if engaged else sm), (vc, q_blocks, hint, grid)
+            for hint in (True, False):
+                assert all(torch.equal(a, b) for a, b in zip(results[None], results[hint])), (vc, q_blocks, hint)
+            assert torch.isfinite(results[None][0].float()).all()
+            print("alias guard hint exact", "vc" if vc else "bf16", q_blocks, flush=True)
+    print("PASS alias guard hint: BF16 and VC out/LSE bit-identical across None/True/False", flush=True)
+
+
 if __name__ == "__main__":
     test_native_preparation()
     test_expcast_reference()
@@ -700,3 +773,4 @@ if __name__ == "__main__":
     test_vsmooth_reference()
     test_native_pipeline()
     test_full_inner_hwmax_exact()
+    test_alias_guard_hint_exact()
