@@ -574,7 +574,7 @@ def test_vsa_stats_grouped_loads_raw_bytes():
             a, b = both(inputs, m, s, qm, block, states=states)
             assert_raw(a, b, ("delayed", block, d, dtype, offset, step))
             fallbacks.append(int(dict(b)["state.fallbacks"]))
-        increments = [y - x for x, y in zip(fallbacks[:-1], fallbacks[1:])]
+        increments = [y - x for x, y in itertools.pairwise(fallbacks)]
         assert max(increments) > 0 and (margins == (1.0, 1.0) or 0 in increments[:3]), (
             block,
             d,
