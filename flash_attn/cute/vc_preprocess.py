@@ -67,10 +67,21 @@ def _library(device_index):
     nvrtc.nvrtcDestroyProgram(ctypes.byref(program))
     driver, module, functions = _load_module(
         ptx,
-        ("rotate_qk", "block_stats", "reduce_stats", "quantize", "fused_stats", "fused_quantize"),
+        (
+            "rotate_qk",
+            "block_stats",
+            "reduce_stats",
+            "quantize",
+            "fused_stats",
+            "fused_quantize",
+            "fused_quantize_stats",
+            "delayed_check",
+            "fallback_quantize",
+        ),
     )
     driver.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
-    _check(driver.cuFuncSetAttribute(functions["fused_stats"], 8, 36864), "cuFuncSetAttribute")
+    for name in ("fused_stats", "fused_quantize_stats"):
+        _check(driver.cuFuncSetAttribute(functions[name], 8, 36864), "cuFuncSetAttribute")
     return driver, module, functions
 
 
@@ -119,6 +130,8 @@ def _launch(name, grid, threads, pointers, integers, stream, wide_last=False):
             1,
             ((32 if integers[1] == 128 else 128) + 16) * integers[1] * 4
             if name == "fused_stats"
+            else ((32 if integers[1] == 128 else 128) + 16) * integers[1] * 4
+            if name == "fused_quantize_stats"
             else 0,
             stream,
             args,
@@ -161,9 +174,57 @@ def _rotate_qk(q, k, bshd=False):
     return oq, ok
 
 
+class VCScaleState:
+    """Caller-owned delayed-scaling state for prepare(): one per attention layer instance (and head/CFG stream).
+
+    Opt-in: prepare() uses it only when the caller passes one. Holds the previous call's {qs, ks, kmean, vs} (scales
+    and statistics only, never payload) in device buffers updated in place, plus device counters. With a state,
+    prepare() quantizes in one pass with the previous scales times power-of-two margins (Q/K 2x, V 2x) while
+    recomputing this call's statistics, then re-quantizes on the device, with fresh scales, every head whose range the margins do not
+    cover or that shrank by more than 2x (no host synchronization; 4 launches instead of 3). An empty or mismatched
+    state takes the unchanged two-pass path and (re)initializes. Use one state per stream; sharing one across
+    differently distributed inputs only causes fallbacks.
+    """
+
+    def __init__(self):
+        self.signature = None
+        self.fallbacks = None  # int32 device counter: heads re-quantized with fresh scales
+        self.saturations = None  # int32 device counter: (128-token block, channel, tensor) slabs that saturated E4M3
+
+    def _init(self, signature, kmean, qs, ks, vs):
+        fresh = (kmean, qs, ks, vs)
+        old = (self.kmean, self.qs, self.ks, self.vs) if self.signature is not None else ()
+        # Reuse in place (graph-safe pointers) only if every buffer matches: kmean/vs depend on D, not only on (B, H).
+        if old and all(
+            (dst.shape, dst.device, dst.dtype) == (src.shape, src.device, src.dtype)
+            for dst, src in zip(old, fresh)
+        ):
+            for dst, src in zip(old, fresh):
+                dst.copy_(src)
+        else:
+            self.kmean, self.qs, self.ks, self.vs = (
+                kmean.clone(),
+                qs.clone(),
+                ks.clone(),
+                vs.clone(),
+            )
+        self.signature = signature
+        if self.fallbacks is None or self.fallbacks.device != qs.device:
+            self.fallbacks = torch.zeros((), device=qs.device, dtype=torch.int32)
+            self.saturations = torch.zeros((), device=qs.device, dtype=torch.int32)
+
+
 @torch.no_grad()
 def prepare(
-    q, k, v, permutation=None, smooth=True, hadamard=True, mean_dtype=torch.bfloat16, bshd=False
+    q,
+    k,
+    v,
+    permutation=None,
+    smooth=True,
+    hadamard=True,
+    mean_dtype=torch.bfloat16,
+    bshd=False,
+    scale_state=None,
 ):
     """Prepare finite contiguous CUDA BHND or BSHD inputs; permutation must be a bijection.
 
@@ -200,6 +261,29 @@ def prepare(
     outputs = [
         torch.empty((b, n, h, d), device=q.device, dtype=torch.float8_e4m3fn) for _ in range(3)
     ]
+    delayed = scale_state is not None and fused
+    signature = (q.device, q.dtype, b, h, n, d, bshd)
+    if delayed and scale_state.signature == signature:
+        return _prepare_delayed(
+            q,
+            k,
+            v,
+            scale_state,
+            stats,
+            means,
+            kmean,
+            qs,
+            ks,
+            vs,
+            outputs,
+            b,
+            h,
+            n,
+            d,
+            nb,
+            bshd,
+            mean_dtype,
+        )
     with torch.cuda.device(q.device):
         stream = torch.cuda.current_stream(q.device).cuda_stream
         dtype = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[q.dtype]
@@ -255,6 +339,8 @@ def prepare(
             stream,
             wide_last=True,
         )
+    if delayed:
+        scale_state._init(signature, kmean, qs, ks, vs)
     return {
         "q": outputs[0],
         "k": outputs[1],
@@ -262,6 +348,85 @@ def prepare(
         "qs": qs,
         "ks": ks,
         "vs": vs,
+        "means": means,
+    }
+
+
+def _prepare_delayed(
+    q, k, v, state, stats, means, kmean, qs, ks, vs, outputs, b, h, n, d, nb, bshd, mean_dtype
+):
+    """Steady state: fused_quantize_stats -> reduce_stats (fresh) -> delayed_check -> fallback_quantize (flagged heads)."""
+    factory = {"device": q.device, "dtype": torch.float32}
+    used_qs, used_ks = torch.empty((b, h), **factory), torch.empty((b, h), **factory)
+    used_vs = torch.empty((b, h, d), **factory)
+    flag = torch.empty((b, h), device=q.device, dtype=torch.int32)
+    with torch.cuda.device(q.device):
+        stream = torch.cuda.current_stream(q.device).cuda_stream
+        dtype = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[q.dtype]
+        _launch(
+            "fused_quantize_stats",
+            b * h * nb,
+            256,
+            [
+                q,
+                k,
+                v,
+                stats,
+                state.kmean,
+                state.qs,
+                state.ks,
+                state.vs,
+                *outputs,
+                state.saturations,
+            ],
+            [n, d, nb, h, dtype, int(bshd)],
+            stream,
+        )
+        _launch(
+            "reduce_stats",
+            b * h,
+            128 if nb == 1 else 1024,
+            [stats, means, kmean, qs, ks, vs],
+            [n, d, nb, int(mean_dtype == torch.float32)],
+            stream,
+        )
+        _launch(
+            "delayed_check",
+            b * h,
+            d,
+            [
+                state.kmean,
+                state.qs,
+                state.ks,
+                state.vs,
+                kmean,
+                qs,
+                ks,
+                vs,
+                flag,
+                used_qs,
+                used_ks,
+                used_vs,
+                state.fallbacks,
+            ],
+            [d],
+            stream,
+        )
+        _launch(
+            "fallback_quantize",
+            b * h * nb,
+            256,
+            [q, k, v, flag, kmean, qs, ks, vs, *outputs],
+            [n, d, nb, h, dtype, int(bshd)],
+            stream,
+        )
+    return {
+        "q": outputs[0],
+        "k": outputs[1],
+        "v": outputs[2],
+        "qs": used_qs,
+        "ks": used_ks,
+        "vs": used_vs,
         "means": means,
     }
 
