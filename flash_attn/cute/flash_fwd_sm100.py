@@ -3386,6 +3386,7 @@ class FlashAttentionForwardSm100:
         vc_mean: Optional[cute.Tensor] = None,
         vc_sum: Float32 = 0.0,
         vc_vscale: Optional[cute.Tensor] = None,
+        zero_fill: cutlass.Constexpr[bool] = False,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -3442,18 +3443,22 @@ class FlashAttentionForwardSm100:
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
             tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
-            cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
-            if const_expr(vc_mean is not None or vc_vscale is not None):
-                for j in cutlass.range_constexpr(cute.size(tOrO_frg)):
-                    d = tOcO_t2r[None,0,0,i][j][1]
-                    if const_expr(vc_mean is not None):
-                        tOrO_frg[j] = tOrO_frg[j] + vc_sum * Float32(vc_mean[d])
-                    if const_expr(vc_vscale is not None):
-                        tOrO_frg[j] = tOrO_frg[j] * Float32(vc_vscale[d])
-            for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
-                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
-                    (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
-                )
+            if const_expr(zero_fill):
+                # Empty tiles have no initialized O accumulator in TMEM.
+                tOrO_frg.fill(0.0)
+            else:
+                cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+                if const_expr(vc_mean is not None or vc_vscale is not None):
+                    for j in cutlass.range_constexpr(cute.size(tOrO_frg)):
+                        d = tOcO_t2r[None,0,0,i][j][1]
+                        if const_expr(vc_mean is not None):
+                            tOrO_frg[j] = tOrO_frg[j] + vc_sum * Float32(vc_mean[d])
+                        if const_expr(vc_vscale is not None):
+                            tOrO_frg[j] = tOrO_frg[j] * Float32(vc_vscale[d])
+                for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                    tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                        (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
+                    )
             copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
         cute.arch.fence_view_async_shared()
 

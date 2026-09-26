@@ -929,11 +929,12 @@ def handle_block_sparse_empty_tile_correction_sm100(
             stage,
             m_block,
             seqlen_info.seqlen_q,
-            Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
+            Float32(0.0),  # zero_fill bypasses unwritten TMEM
             sO[None, None, stage],
             mO_cur,
             gO_stage,
             gmem_tiled_copy_O,
+            zero_fill=True,
         )
         if const_expr(gmem_tiled_copy_O is None):
             pipeline_o_epi.producer_commit_w_index(stage)
