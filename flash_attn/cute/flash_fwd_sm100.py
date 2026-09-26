@@ -3233,8 +3233,8 @@ class FlashAttentionForwardSm100:
                 total_block_count = n_block_max - n_block_min
                 has_work = self.process_work_tile(seqlen, n_block_min, n_block_max)
 
-            if const_expr(self.kv_pingpong):
-                if has_work:
+            if has_work:
+                if const_expr(self.kv_pingpong):
                     gO_stage = gO[None, None, 0] if const_expr(gO is not None) else None
                     (
                         o_corr_consumer_phase,
@@ -3267,131 +3267,131 @@ class FlashAttentionForwardSm100:
                         track_row_max=mLSE is not None,
                     )
                     stats[0] = tile_stats
-            elif has_work:
-                # Ignore first signal from softmax as no correction is required
-                # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
-                sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
-                pipeline_sm_stats.consumer_release_w_index(0)
-                if const_expr(self.q_stage == 2):
-                    # pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
-                    sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
-                    if const_expr(self.vc_tc):
-                        pipeline_sm_stats.consumer_release_w_index(1)
-                sm_stats_consumer_phase ^= 1
+                else:
+                    # Ignore first signal from softmax as no correction is required
+                    # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
+                    sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
+                    pipeline_sm_stats.consumer_release_w_index(0)
+                    if const_expr(self.q_stage == 2):
+                        # pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
+                        sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
+                        if const_expr(self.vc_tc):
+                            pipeline_sm_stats.consumer_release_w_index(1)
+                    sm_stats_consumer_phase ^= 1
 
-                tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
-                for i in cutlass.range(total_block_count - 1, unroll=1):
+                    tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
+                    for i in cutlass.range(total_block_count - 1, unroll=1):
+                        for stage in cutlass.range_constexpr(self.q_stage):
+                            # wait for S0 / S1
+                            # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                            sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                            # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
+                            # cute.arch.fence_view_async_tmem_load()
+                            # scale = tSrScale_t2r[0]
+                            scale = sScale[tidx + stage * self.m_block_size]
+                            should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                            # should_rescale = True
+                            # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
+                            # Don't need O_full anymore, since by the time softmax has signaled the correction
+                            # warps, S_i must have been done, so O_i-1 must have been done as well.
+                            # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                            if const_expr(self.vc_smooth and not self.vc_tc):
+                                previous_sum = sScale[tidx + (stage + self.vc_stats_offset) * self.m_block_size]
+                                self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale,
+                                                        v_mean[n_block_max-1-i,None], previous_sum)
+                            elif should_rescale:
+                                self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                            # Notify mma warp that O has been rescaled
+                            if const_expr(self.vc_tc):
+                                pipeline_sm_stats.consumer_release_w_index(stage)
+                            pipeline_s_p_o.consumer_release_w_index(stage)
+                            if const_expr(not self.vc_tc):
+                                pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+                        sm_stats_consumer_phase ^= 1
+                        # o_corr_consumer_phase ^= 1
+                    if const_expr(self.q_stage == 2 and not self.vc_tc):
+                        pipeline_sm_stats.consumer_release_w_index(1)
+                    # End of seqlen_corr_loop_steps
+
+                    # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
+                    # additional sync because the MMA in the top half must have been done.
+                    # Similarly we can write to stage 1 of sO without additional sync.
+                    learnable_sink_val = [None] * self.q_stage
+                    if const_expr(learnable_sink is not None):
+                        if const_expr(not self.pack_gqa):
+                            learnable_sink_val = [Float32(learnable_sink[head_idx])] * self.q_stage
+                        else:  # Each thread might have a different sink value due to different q_head
+                            for stage in cutlass.range_constexpr(self.q_stage):
+                                packed_row = (
+                                    (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
+                                ) * self.m_block_size + tidx
+                                learnable_sink_val[stage] = load_learnable_sink(
+                                    learnable_sink, head_idx, packed_row, self.qhead_per_kvhead, self.pack_gqa
+                                )
                     for stage in cutlass.range_constexpr(self.q_stage):
-                        # wait for S0 / S1
                         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                         sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + stage * self.m_block_size]
-                        should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
-                        # should_rescale = True
-                        # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
-                        # Don't need O_full anymore, since by the time softmax has signaled the correction
-                        # warps, S_i must have been done, so O_i-1 must have been done as well.
-                        # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                        row_sum = sScale[tidx + stage * self.m_block_size]
+                        last_mean = None
+                        last_sum = Float32(0.0)
                         if const_expr(self.vc_smooth and not self.vc_tc):
-                            previous_sum = sScale[tidx + (stage + self.vc_stats_offset) * self.m_block_size]
-                            self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale,
-                                                    v_mean[n_block_max-1-i,None], previous_sum)
-                        elif should_rescale:
-                            self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
-                        # Notify mma warp that O has been rescaled
-                        if const_expr(self.vc_tc):
-                            pipeline_sm_stats.consumer_release_w_index(stage)
+                            last_sum = sScale[tidx + (stage + self.vc_stats_offset) * self.m_block_size]
+                            last_mean = v_mean[n_block_min,None]
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
+                        else:
+                            row_max = None
+                        pipeline_sm_stats.consumer_release_w_index(stage)
+                        if const_expr(learnable_sink is not None):
+                            # Only the first split owns the sink column; empty rows occur with splitKV.
+                            if const_expr(not self.is_split_kv) or split_idx == 0:
+                                row_max, row_sum = apply_learnable_sink(
+                                    row_max,
+                                    row_sum,
+                                    learnable_sink_val[stage],
+                                    softmax_scale_log2_eff,
+                                    max_offset=max_offset,
+                                    empty_row_sum=max_offset_scale,
+                                )
+                        acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                        stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                        scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                        scale = scale * v_descale
+                        # Wait for the last O to be ready from the MMA warp
+                        pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                        if const_expr(not self.use_correction_warps_for_epi):
+                            pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
+                        gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
+                        self.correction_epilogue(
+                            thr_mma_pv,
+                            tOtO[None, None, None, stage],
+                            tidx,
+                            stage,
+                            m_block,
+                            seqlen.seqlen_q,
+                            scale,
+                            sO[None, None, stage],
+                            mO_cur,
+                            gO_stage,
+                            gmem_tiled_copy_O,
+                            vc_mean=last_mean,
+                            vc_sum=last_sum,
+                            vc_vscale=v_channel_scale,
+                        )
+                        # Signal for the next work tile that O buffers in tmem are already read, so
+                        # mma warp can write to them
                         pipeline_s_p_o.consumer_release_w_index(stage)
-                        if const_expr(not self.vc_tc):
-                            pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
+                        if const_expr(not self.use_correction_warps_for_epi):
+                            pipeline_o_epi.producer_commit_w_index(stage)
+                        # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
+
+                    o_corr_consumer_phase ^= 1
                     sm_stats_consumer_phase ^= 1
-                    # o_corr_consumer_phase ^= 1
-                if const_expr(self.q_stage == 2 and not self.vc_tc):
-                    pipeline_sm_stats.consumer_release_w_index(1)
-                # End of seqlen_corr_loop_steps
-
-                # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
-                # additional sync because the MMA in the top half must have been done.
-                # Similarly we can write to stage 1 of sO without additional sync.
-                learnable_sink_val = [None] * self.q_stage
-                if const_expr(learnable_sink is not None):
-                    if const_expr(not self.pack_gqa):
-                        learnable_sink_val = [Float32(learnable_sink[head_idx])] * self.q_stage
-                    else:  # Each thread might have a different sink value due to different q_head
-                        for stage in cutlass.range_constexpr(self.q_stage):
-                            packed_row = (
-                                (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
-                            ) * self.m_block_size + tidx
-                            learnable_sink_val[stage] = load_learnable_sink(
-                                learnable_sink, head_idx, packed_row, self.qhead_per_kvhead, self.pack_gqa
-                            )
-                for stage in cutlass.range_constexpr(self.q_stage):
-                    # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-                    sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
-                    # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
-                    # cute.arch.fence_view_async_tmem_load()
-                    # scale = tSrScale_t2r[0]
-                    row_sum = sScale[tidx + stage * self.m_block_size]
-                    last_mean = None
-                    last_sum = Float32(0.0)
-                    if const_expr(self.vc_smooth and not self.vc_tc):
-                        last_sum = sScale[tidx + (stage + self.vc_stats_offset) * self.m_block_size]
-                        last_mean = v_mean[n_block_min,None]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
-                    else:
-                        row_max = None
-                    pipeline_sm_stats.consumer_release_w_index(stage)
-                    if const_expr(learnable_sink is not None):
-                        # Only the first split owns the sink column; empty rows occur with splitKV.
-                        if const_expr(not self.is_split_kv) or split_idx == 0:
-                            row_max, row_sum = apply_learnable_sink(
-                                row_max,
-                                row_sum,
-                                learnable_sink_val[stage],
-                                softmax_scale_log2_eff,
-                                max_offset=max_offset,
-                                empty_row_sum=max_offset_scale,
-                            )
-                    acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-                    stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
-                    scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
-                    scale = scale * v_descale
-                    # Wait for the last O to be ready from the MMA warp
-                    pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
-                    if const_expr(not self.use_correction_warps_for_epi):
-                        pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
-                    gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
-                    self.correction_epilogue(
-                        thr_mma_pv,
-                        tOtO[None, None, None, stage],
-                        tidx,
-                        stage,
-                        m_block,
-                        seqlen.seqlen_q,
-                        scale,
-                        sO[None, None, stage],
-                        mO_cur,
-                        gO_stage,
-                        gmem_tiled_copy_O,
-                        vc_mean=last_mean,
-                        vc_sum=last_sum,
-                        vc_vscale=v_channel_scale,
-                    )
-                    # Signal for the next work tile that O buffers in tmem are already read, so
-                    # mma warp can write to them
-                    pipeline_s_p_o.consumer_release_w_index(stage)
-                    if const_expr(not self.use_correction_warps_for_epi):
-                        pipeline_o_epi.producer_commit_w_index(stage)
-                    # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
-
-                o_corr_consumer_phase ^= 1
-                sm_stats_consumer_phase ^= 1
-                corr_epi_producer_phase ^= 1
-            if not has_work:
+                    corr_epi_producer_phase ^= 1
+            else:
                 gmem_tiled_copy_O_for_empty_tile = None
                 if const_expr(self.use_correction_warps_for_epi):
                     gmem_tiled_copy_O_for_empty_tile = gmem_tiled_copy_O
