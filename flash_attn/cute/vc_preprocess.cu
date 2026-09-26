@@ -215,7 +215,7 @@ extern "C" __global__ void quantize(const void *q, const void *k, const void *v,
 }
 
 // Same logical butterfly-bit order as rotate_qk_impl; contiguous channels per lane.
-template<int D> __device__ void rotate_contiguous(float (&q)[D/32],float (&k)[D/32],float scale) {
+template<int D, bool SignedFma=false> __device__ void rotate_contiguous(float (&q)[D/32],float (&k)[D/32],float scale) {
     constexpr int W=D/32;int lane=threadIdx.x%32;
     #pragma unroll
     for(int bit=1;bit<W;bit*=2){
@@ -230,7 +230,12 @@ template<int D> __device__ void rotate_contiguous(float (&q)[D/32],float (&k)[D/
         #pragma unroll
         for(int j=0;j<W;++j){
             float qp=__shfl_xor_sync(0xffffffff,q[j],bit),kp=__shfl_xor_sync(0xffffffff,k[j],bit);
-            q[j]=lane&bit?qp-q[j]:qp+q[j];k[j]=lane&bit?kp-k[j]:kp+k[j];
+            if constexpr(SignedFma) {
+                float sign=lane&bit ? -1.0f : 1.0f;
+                q[j]=__fmaf_rn(sign,q[j],qp);k[j]=__fmaf_rn(sign,k[j],kp);
+            } else {
+                q[j]=lane&bit?qp-q[j]:qp+q[j];k[j]=lane&bit?kp-k[j]:kp+k[j];
+            }
         }
     }
     #pragma unroll
@@ -308,7 +313,7 @@ template<int D> __device__ void fused_quant_impl(const void *q,const void *k,con
     read_contiguous<D>(q,src,dtype,qr);
     read_contiguous<D>(k,src,dtype,kr);
     read_contiguous<D>(v,src,dtype,vr);
-    rotate_contiguous<D>(qr,kr,scale);
+    rotate_contiguous<D,true>(qr,kr,scale);
     #pragma unroll
     for(int j=0;j<W;++j){qr[j]/=qs[bh];kr[j]=(kr[j]-kmean[bh*D+c+j])/ks[bh];vr[j]/=vs[bh*D+c+j];}
     if constexpr(D==128){

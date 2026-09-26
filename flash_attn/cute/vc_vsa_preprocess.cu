@@ -184,7 +184,7 @@ template<int D> __device__ __forceinline__ void vsa_quantize_token(
             vr[j]=valid ? read_input(v,src+j,dtype) : 0;
         }
     }
-    rotate_contiguous<D>(qr,kr,scale);
+    rotate_contiguous<D,true>(qr,kr,scale);
     #pragma unroll
     for(int j=0;j<W;++j) {
         qr[j]/=qs[bh]; kr[j]=(kr[j]-kmean[bh*D+c+j])/ks[bh]; vr[j]/=vs[bh*D+c+j];
