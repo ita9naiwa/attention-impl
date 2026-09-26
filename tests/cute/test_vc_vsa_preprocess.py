@@ -496,6 +496,18 @@ def test_vsa_stats_grouped_loads_raw_bytes():
         assert_raw(*both(v, m, s, qm, 256, query_tokens=nq), ("canonical", offset))
     print(f"cold raw-byte parity PASS ({cases} cases)", flush=True)
 
+    # Aligned D128 BF16 (the grouped branch) over all 8 int32/int64 metadata mixes, cold and delayed.
+    for block, mix in itertools.product((128, 256), metadata):
+        values, m, s, qm = make_inputs(block, 128, torch.bfloat16, 2, 3, mix)
+        assert all(x.data_ptr() % 8 == 0 for x in values)
+        assert_raw(*both(values, m, s, qm, block), ("aligned D128 metadata", block, mix))
+        states = (VCScaleState(), VCScaleState())
+        for step, gain in enumerate((1.0, 1.0, 4.0)):  # init (cold), warm, drift fallback
+            inputs = values if step < 2 else [x * gain for x in values]
+            a, b = both(inputs, m, s, qm, block, states=states)
+            assert_raw(a, b, ("aligned D128 metadata delayed", block, mix, step))
+    print("aligned D128 BF16 all metadata mixes cold + delayed raw-byte parity PASS", flush=True)
+
     # Changed inputs, eager and CUDA graph replay, cold and delayed; aligned and unaligned BF16 D128.
     for offset in ((0, 0, 0), (1, 0, 3)):
         values, m, s, qm = make_inputs(256, 128, torch.bfloat16)
