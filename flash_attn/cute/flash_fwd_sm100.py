@@ -896,13 +896,11 @@ class FlashAttentionForwardSm100:
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
             blocks_to_batch_idx_ptr=mBlocksToBatchIdx,
             tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
-            # Grid alias guard for the block-sparse Q256 1-CTA static persistent forward. alias_guard_hint None keeps
-            # the default (BF16 on, VC ExpCast off); True/False force it (the caller knows whether rows are imbalanced).
+            # Grid alias guard for the block-sparse Q256 1-CTA static persistent forward: opt-in (alias_guard_hint True)
+            # only; the caller knows whether rows are imbalanced (H3 dense prefix). None/False keep the SM-count grid.
             alias_guard=TileScheduler is StaticPersistentTileScheduler
             and blocksparse_tensors is not None
-            and (self.alias_guard_hint
-                 if self.alias_guard_hint is not None
-                 else self.q_dtype == cutlass.BFloat16 and not self.vc_expcast)
+            and self.alias_guard_hint is True
             and not (self.is_causal or self.is_local or self.is_split_kv or self.pack_gqa)
             and mCuSeqlensQ is None
             and mSeqUsedQ is None

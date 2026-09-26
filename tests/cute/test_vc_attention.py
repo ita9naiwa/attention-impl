@@ -696,7 +696,7 @@ def test_alias_guard_hint_exact():
     """alias_guard hint (None/True/False) on the block-sparse Q256 forward, BF16 and VC ExpCast: out/LSE bit-identical.
 
     The guard only shrinks the persistent grid (148 -> 146 CTAs on B300) when the Q256 block count and the SM count divide
-    each other. None keeps the default (BF16 on, VC off); True/False force it. Q = 37/74/148 alias, Q = 150 is the control.
+    each other. Only True engages it (None/False keep the SM-count grid). Q = 37/74/148 alias, Q = 150 is the control.
     """
     if torch.cuda.get_device_capability() != (10, 3):
         print("SKIP alias guard hint: requires SM103")
@@ -755,7 +755,7 @@ def test_alias_guard_hint_exact():
                         aux_tensors=[aux], return_lse=True, alias_guard=hint, **(vc_args if vc else {}),
                     )[:2]
                 results[hint] = [t.clone() for t in run()]
-                engaged = aliased and (hint if hint is not None else not vc)
+                engaged = aliased and hint is True
                 grid = fwd_grid(run)
                 assert grid == (sm - 2 if engaged else sm), (vc, q_blocks, hint, grid)
             for hint in (True, False):

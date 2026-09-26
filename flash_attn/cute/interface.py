@@ -614,7 +614,8 @@ def _flash_attn_fwd(
         vc_vbs128: Use the built-in physical-KV128 valid-count mask (aux[0] values in [0,128]).
             Requires fixed-length sparse QKV and mask_mod=None; enables compact VC when supported.
         alias_guard: Persistent-grid alias guard hint for the block-sparse Q256 1-CTA static persistent forward.
-            None keeps the default (on for BF16, off for VC ExpCast); True/False force it on/off. Bit-exact either way.
+            True turns it on (for launches whose dense prefix rows pile onto the same CTAs); None/False keep the
+            SM-count grid. Bit-exact either way.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
             The returned LSE supports taking gradient.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
