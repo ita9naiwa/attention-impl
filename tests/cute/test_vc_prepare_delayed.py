@@ -222,3 +222,21 @@ def test_state_reuse_across_head_dim_and_heads():
             prepare(*second, smooth=False, bshd=True, scale_state=state),
             prepare(*second, smooth=False, bshd=True, scale_state=mirror),
         )
+
+
+def test_shared_state_class_and_margins():
+    # One VCScaleState class serves prepare() and prepare_vsa(); each resolves unset margins to its own defaults.
+    from flash_attn.cute import vc_vsa_preprocess
+    from flash_attn.cute.vc_preprocess import PREPARE_MARGINS, PREPARE_VSA_MARGINS
+
+    assert vc_vsa_preprocess.VCScaleState is VCScaleState
+    assert VCScaleState().margins(PREPARE_MARGINS) == (2.0, 2.0)
+    assert VCScaleState().margins(PREPARE_VSA_MARGINS) == (1.5, 2.0)
+    assert VCScaleState(v_margin=4).margins(PREPARE_VSA_MARGINS) == (1.5, 4.0)
+    x = _inputs()
+    assert _equal(
+        prepare(*x, smooth=False, bshd=True, scale_state=VCScaleState(2.0, 2.0)),
+        prepare(*x, smooth=False, bshd=True),
+    )
+    with pytest.raises(ValueError, match="compiled margins"):
+        prepare(*x, smooth=False, bshd=True, scale_state=VCScaleState(1.5))

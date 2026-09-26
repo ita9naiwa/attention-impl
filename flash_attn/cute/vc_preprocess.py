@@ -174,27 +174,49 @@ def _rotate_qk(q, k, bshd=False):
     return oq, ok
 
 
-class VCScaleState:
-    """Caller-owned delayed-scaling state for prepare(): one per attention layer instance (and head/CFG stream).
+# prepare() compiles its margins into vc_preprocess.cu (QK_MARGIN / V_MARGIN): powers of two, so warm codes stay on
+# the cold E4M3 grid. prepare_vsa() passes the state's margins to its kernels at run time (default 1.5 / 2.0).
+PREPARE_MARGINS = (2.0, 2.0)
+PREPARE_VSA_MARGINS = (1.5, 2.0)
 
-    Opt-in: prepare() uses it only when the caller passes one. Holds the previous call's {qs, ks, kmean, vs} (scales
-    and statistics only, never payload) in device buffers updated in place, plus device counters. With a state,
-    prepare() quantizes in one pass with the previous scales times power-of-two margins (Q/K 2x, V 2x) while
-    recomputing this call's statistics, then re-quantizes on the device, with fresh scales, every head whose range the margins do not
-    cover or that shrank by more than 2x (no host synchronization; 4 launches instead of 3). An empty or mismatched
-    state takes the unchanged two-pass path and (re)initializes. Use one state per stream; sharing one across
+
+class VCScaleState:
+    """Caller-owned delayed-scaling state for prepare() and prepare_vsa(): one per attention layer instance, entry
+    point and stream (head/CFG).
+
+    Opt-in: used only when passed as scale_state. Holds the previous call's {kmean, qs, ks, vs} (scales and
+    statistics only, never payload) in device buffers updated in place, plus int32 device counters. With a matching
+    state, the entry point quantizes in one pass with the previous scales times margins (qk_margin for Q/K,
+    v_margin for V) while recomputing this call's statistics, then re-quantizes on the device, with fresh scales,
+    every (b,h) whose fresh range the used scales do not cover or that shrank by more than 2x (no host
+    synchronization). An empty or mismatched state (the signature includes the entry point's shapes) takes the
+    unchanged cold path and (re)initializes. Returned descales are the ones actually used. Sharing one state across
     differently distributed inputs only causes fallbacks.
+
+    Margins default (None) to the entry point's own: PREPARE_MARGINS for prepare(), which accepts only those
+    (compiled), and PREPARE_VSA_MARGINS for prepare_vsa(), which accepts any.
     """
 
-    def __init__(self):
+    def __init__(self, qk_margin=None, v_margin=None):
         self.signature = None
-        self.fallbacks = None  # int32 device counter: heads re-quantized with fresh scales
-        self.saturations = None  # int32 device counter: (128-token block, channel, tensor) slabs that saturated E4M3
+        self.qk_margin = None if qk_margin is None else float(qk_margin)
+        self.v_margin = None if v_margin is None else float(v_margin)
+        self.fallbacks = None  # int32 device counter: (b,h) re-quantized with fresh scales
+        # int32 device counter: (block, channel, tensor) slabs over E4M3 range in attempted warm-path stores
+        # (prepare_vsa: including padded K slots and heads later overwritten by a fallback).
+        self.saturations = None
+
+    def margins(self, default):
+        """(qk_margin, v_margin), each unset one taken from the entry point's default pair."""
+        return tuple(
+            d if m is None else m for m, d in zip((self.qk_margin, self.v_margin), default)
+        )
 
     def _init(self, signature, kmean, qs, ks, vs):
         fresh = (kmean, qs, ks, vs)
         old = (self.kmean, self.qs, self.ks, self.vs) if self.signature is not None else ()
-        # Reuse in place (graph-safe pointers) only if every buffer matches: kmean/vs depend on D, not only on (B, H).
+        # Reuse in place (graph-safe pointers) only if every buffer matches: kmean/vs depend on D, not only on
+        # (B, H), and a dtype change must not be silently cast by copy_.
         if old and all(
             (dst.shape, dst.device, dst.dtype) == (src.shape, src.device, src.dtype)
             for dst, src in zip(old, fresh)
@@ -262,6 +284,8 @@ def prepare(
         torch.empty((b, n, h, d), device=q.device, dtype=torch.float8_e4m3fn) for _ in range(3)
     ]
     delayed = scale_state is not None and fused
+    if delayed and scale_state.margins(PREPARE_MARGINS) != PREPARE_MARGINS:
+        raise ValueError(f"prepare() delayed scaling uses the compiled margins {PREPARE_MARGINS}")
     signature = (q.device, q.dtype, b, h, n, d, bshd)
     if delayed and scale_state.signature == signature:
         return _prepare_delayed(

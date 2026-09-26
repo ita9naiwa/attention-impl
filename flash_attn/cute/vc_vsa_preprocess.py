@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 from flash_attn.cute import vc_preprocess as native
+from flash_attn.cute.vc_preprocess import PREPARE_VSA_MARGINS, VCScaleState  # noqa: F401 (re-export)
 
 
 def _ok(result):
@@ -72,47 +73,6 @@ def _launch(name, grid, threads, pointers, integers, stream, floats=()):
     native._check(
         driver.cuLaunchKernel(functions[name], *grid, threads, 1, 1, 0, stream, args, None), name
     )
-
-
-class VCScaleState:
-    """Caller-owned delayed-scaling state for prepare_vsa(): one per attention layer instance and stream.
-
-    Opt-in: used only when passed as scale_state. Holds the previous call's {kmean, qs, ks, vs} (statistics
-    only, never payload) in device buffers updated in place, plus int32 device counters. With a matching
-    state, prepare_vsa() reads each source row once, storing E4M3 with the state's scales times margins
-    (qk_margin for Q/K, v_margin for V) while computing this call's statistics and pools; every (b,h) whose
-    fresh range the used scales do not cover, or that shrank by more than 2x, is re-quantized on the device
-    with fresh scales (no host synchronization). An empty or mismatched state takes the unchanged cold path
-    and (re)initializes. Returned descales are the ones actually used and are independent of the state.
-    """
-
-    def __init__(self, qk_margin=1.5, v_margin=2.0):
-        self.signature = None
-        self.qk_margin, self.v_margin = float(qk_margin), float(v_margin)
-        self.fallbacks = None  # int32 device counter: (b,h) re-quantized with fresh scales
-        # int32 device counter: (block, channel, tensor) slabs over E4M3 range in attempted warm-path
-        # stores, including padded K slots and heads later overwritten by a fallback.
-        self.saturations = None
-
-    def _init(self, signature, kmean, qs, ks, vs):
-        fresh = (kmean, qs, ks, vs)
-        buffers = None if self.signature is None else (self.kmean, self.qs, self.ks, self.vs)
-        if buffers is not None and all(
-            a.shape == b.shape and a.device == b.device for a, b in zip(buffers, fresh)
-        ):
-            for dst, src in zip(buffers, fresh):
-                dst.copy_(src)
-        else:
-            self.kmean, self.qs, self.ks, self.vs = (
-                kmean.clone(),
-                qs.clone(),
-                ks.clone(),
-                vs.clone(),
-            )
-        self.signature = signature
-        if self.fallbacks is None or self.fallbacks.device != qs.device:
-            self.fallbacks = torch.zeros((), device=qs.device, dtype=torch.int32)
-            self.saturations = torch.zeros((), device=qs.device, dtype=torch.int32)
 
 
 def prepare_vsa(
@@ -202,7 +162,7 @@ def prepare_vsa(
             used_qs, used_ks = (torch.empty((b, h), **factory) for _ in range(2))
             used_vs = torch.empty((b, h, d), **factory)
             flag = torch.empty((b, h), device=q.device, dtype=torch.int32)
-            margins = (st.qk_margin, st.v_margin)
+            margins = st.margins(PREPARE_VSA_MARGINS)
             _launch(
                 "vsa_stats_delayed",
                 (blocks, h, b),
