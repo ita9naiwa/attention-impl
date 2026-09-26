@@ -1143,6 +1143,172 @@ def softmax_block_sparse_sm100(
     )
 
 
+@cute.jit
+def softmax_block_sparse_sm100_kv_pingpong(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    seqlen_info: SeqlenInfoQK,
+    split_idx: Int32,
+    num_splits: Int32,
+    softmax_step: Callable,
+    mask_fn: Callable,
+    mask_fn_none: Callable,
+    mma_si_consumer_phase: Int32,
+    si_corr_producer_phase: Int32,
+    s0_s1_sequence_phase: Int32,
+    pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
+    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
+    q_stage: cutlass.Constexpr,
+    stage_idx: Int32,
+    check_m_boundary: bool,
+    qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
+):
+    """kv_pingpong walk (same contract as softmax_block_sparse_sm100): slot `stage_idx` runs
+    global tiles j = slot, slot + 2, ... of the load order (mask list, then full list, each
+    reversed). Each tile keeps the mask it gets on the one-stream path (seqlen mask on list
+    position 0 only); `is_first` marks the slot's first tile. Slot 1 does nothing when the
+    tile has < 2 blocks; slot 0 keeps the empty-tile arrive. Returns empty=True when this slot
+    publishes no stats.
+    """
+    assert kv_subtile_factor == 1
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+    slot = stage_idx
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+    mask_cnt, mask_idx, full_cnt, full_idx = get_curr_blocksparse_tensors(
+        batch_idx, head_idx, m_block_sparse, blocksparse_tensors, seqlen_info
+    )
+    mask_begin, mask_end = split_block_range(mask_cnt, split_idx, num_splits)
+    full_begin, full_end = split_block_range(full_cnt, split_idx, num_splits)
+    n_mask = mask_end - mask_begin
+    n_full = full_end - full_begin
+    total_block_cnt = n_mask + n_full
+
+    mask_first = partial(mask_fn, mask_seqlen=True, check_q_boundary=check_m_boundary)
+    mask_inner = partial(mask_fn, mask_seqlen=False, check_q_boundary=check_m_boundary)
+    full_first = partial(mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary)
+    full_inner = (
+        None
+        if const_expr(check_m_boundary is False)
+        else partial(mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary)
+    )
+
+    if total_block_cnt == 0:
+        if slot == 0:
+            sm_stats_barrier.arrive_w_index(index=slot * 4 + warp_idx)
+    elif total_block_cnt > slot:
+        # First tile of this slot (global j = slot).
+        if slot < n_mask:
+            n_block = mask_idx[mask_end - 1 - slot]
+            if slot == 0:
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    n_block,
+                    is_first=True,
+                    mask_fn=mask_first,
+                )
+            else:
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    n_block,
+                    is_first=True,
+                    mask_fn=mask_inner,
+                )
+        else:
+            q0 = slot - n_mask  # full-list position, 0 or 1
+            n_block = full_idx[full_end - 1 - q0]
+            if q0 == 0:
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    n_block,
+                    is_first=True,
+                    mask_fn=full_first,
+                )
+            else:
+                (
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                ) = softmax_step(
+                    mma_si_consumer_phase,
+                    si_corr_producer_phase,
+                    s0_s1_sequence_phase,
+                    n_block,
+                    is_first=True,
+                    mask_fn=full_inner,
+                )
+        # Remaining mask-list tiles of this slot: positions slot + 2, slot + 4, ... (all inner).
+        for p in cutlass.range(slot + 2, n_mask, 2, unroll=1):
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                mask_idx[mask_end - 1 - p],
+                mask_fn=mask_inner,
+            )
+        # Remaining full-list tiles: position q has global j = n_mask + q, j % 2 == slot, j > slot.
+        q_start = (slot + n_mask) & 1
+        if n_mask <= slot:
+            q_start = slot - n_mask + 2
+        if q_start == 0 and n_full > 0:
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                full_idx[full_end - 1],
+                mask_fn=full_first,
+            )
+            q_start = Int32(2)
+        for q in cutlass.range(q_start, n_full, 2, unroll=1):
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                full_idx[full_end - 1 - q],
+                mask_fn=full_inner,
+            )
+
+    return (
+        mma_si_consumer_phase,
+        si_corr_producer_phase,
+        s0_s1_sequence_phase,
+        total_block_cnt <= slot,
+    )
+
+
 # =============================================================================
 # Backward-specific block-sparse helpers (SM100)
 # =============================================================================

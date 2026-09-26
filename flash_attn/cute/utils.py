@@ -63,6 +63,8 @@ POLY_EX2 = {
 
 _fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
 _fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
+# Q128 block-sparse forward KV ping-pong (flash_fwd_sm100 kv_pingpong); "0" forces the one-stream path.
+_fa_kv_pingpong_enabled: bool = os.environ.get("FA_KV_PINGPONG", "1") != "0"
 
 
 def _is_cuda_12() -> bool:
