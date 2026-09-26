@@ -248,10 +248,12 @@ template<int D> __device__ void fused_stats_impl(const void *q,const void *k,con
     for(int j=0;j<W;++j){qmax[j]=0;vmax[j]=0;}
     int c=threadIdx.x;
     float sk=0,lo=INFINITY,hi=-INFINITY;
+    int64_t row_base=input_index(bh,start,lane*W,n,h,D,bshd);
+    int64_t row_stride=(bshd?(int64_t)h:1)*D;
     for(int slab=0;slab<128;slab+=ROWS){
         for(int local=warp;local<ROWS;local+=8){
             int row=slab+local;
-            int64_t base=input_index(bh,start+row,lane*W,n,h,D,bshd);
+            int64_t base=row_base+row*row_stride;
             float qr[W],kr[W],vr[W];
             if(row<count){
                 read_contiguous<D>(q,base,dtype,qr);
@@ -287,7 +289,7 @@ template<int D> __device__ void fused_stats_impl(const void *q,const void *k,con
         stats[s]=sk;stats[s+D]=lo;stats[s+2*D]=hi;stats[s+3*D]=aq;stats[s+4*D]=av;stats[s+5*D]=0;
     }
 }
-extern "C" __global__ void fused_stats(const void *q,const void *k,const void *v,
+extern "C" __global__ __launch_bounds__(256, 6) void fused_stats(const void *q,const void *k,const void *v,
  const int64_t *perm,float *stats,int n,int d,int nb,int h,int qkdtype,int vdtype,bool smooth,bool qk_bshd,bool v_bshd){
     float scale=rsqrtf((float)d);
     if(d==64)fused_stats_impl<64>(q,k,v,stats,n,nb,h,qkdtype,qk_bshd,scale);
