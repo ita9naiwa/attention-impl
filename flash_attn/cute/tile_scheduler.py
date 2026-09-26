@@ -217,6 +217,7 @@ class TileSchedulerArguments(ParamsBase):
     blocks_to_batch_idx_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
+    alias_guard: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -356,6 +357,7 @@ class StaticPersistentTileScheduler:
         num_head_divmod: FastDivmodDivisorV2
         total_blocks_cluster: Int32
         cluster_shape_m: cutlass.Constexpr[int] = 1
+        alias_guard: cutlass.Constexpr[bool] = False
 
         @staticmethod
         def create(
@@ -368,6 +370,7 @@ class StaticPersistentTileScheduler:
                 FastDivmodDivisorV2(args.num_head),
                 total_blocks_cluster,
                 cluster_shape_m=args.cluster_shape_mn[0],
+                alias_guard=args.alias_guard,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -409,6 +412,19 @@ class StaticPersistentTileScheduler:
         hardware_info = cutlass.utils.HardwareInfo()
         sm_count = hardware_info.get_device_multiprocessor_count()
         max_ctas = (sm_count // params.cluster_shape_m) * params.cluster_shape_m
+        if const_expr(params.alias_guard):
+            # When Q blocks and the persistent grid divide each other, the grid stride pins each CTA to the
+            # same Q blocks for every head (dense prefix rows pile up). Shrink the CTA cap by 2 (3 if still
+            # aliased) before clamping to the work count, so short grids never gain a wave. Branch-free:
+            # this is a plain staticmethod (no DSL control flow); max(., 1) keeps the modulo defined.
+            num_block = cutlass.max(params.num_block_cluster_divmod.divisor, 1)
+
+            def aliased(grid):
+                return 1 - cutlass.min((num_block % grid) * (grid % num_block), 1)
+
+            shrink = aliased(max_ctas) * cutlass.min(cutlass.max(max_ctas - 3, 0), 1)
+            max_ctas = max_ctas - 2 * shrink
+            max_ctas = max_ctas - shrink * aliased(max_ctas)
         grid_x = cutlass.min(max_ctas, params.total_blocks_cluster * params.cluster_shape_m)
         return (grid_x, Int32(1), Int32(1))
 

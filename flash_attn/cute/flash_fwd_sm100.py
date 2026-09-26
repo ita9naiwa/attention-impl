@@ -895,6 +895,15 @@ class FlashAttentionForwardSm100:
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
             blocks_to_batch_idx_ptr=mBlocksToBatchIdx,
             tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
+            # Grid alias guard: BF16 block-sparse Q256 1-CTA static persistent forward only (VSA).
+            alias_guard=TileScheduler is StaticPersistentTileScheduler
+            and blocksparse_tensors is not None
+            and self.q_dtype == cutlass.BFloat16
+            and not (self.is_causal or self.is_local or self.is_split_kv or self.pack_gqa or self.vc_expcast)
+            and mCuSeqlensQ is None
+            and mSeqUsedQ is None
+            and self.cluster_shape_mn == (1, 1)
+            and self.cta_tiler[0] == 256,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode
