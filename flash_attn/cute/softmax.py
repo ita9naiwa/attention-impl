@@ -364,14 +364,25 @@ class SoftmaxSm100(Softmax):
         return self.update_row_max_from_local(row_max_new, is_first)
 
     @cute.jit
-    def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
+    def update_row_max(
+        self, acc_S_row: cute.TensorSSA, is_first: int, row_max_local: Float32 | None = None
+    ) -> Tuple[Float32, Float32]:
+        """row_max_local: this tile's max already reduced (e.g. tcgen05.ld.red); skips the fmax tree."""
         if cutlass.const_expr(is_first):
-            row_max_new = self._compute_row_max(acc_S_row)
+            row_max_new = (
+                self._compute_row_max(acc_S_row)
+                if cutlass.const_expr(row_max_local is None)
+                else row_max_local
+            )
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale = 0.0
         else:
             row_max_old = self.row_max[0]
-            row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
+            row_max_new = (
+                self._compute_row_max(acc_S_row, init_val=row_max_old)
+                if cutlass.const_expr(row_max_local is None)
+                else cute.arch.fmax(row_max_local, row_max_old)
+            )
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
             acc_scale = cute.math.exp2(acc_scale_, fastmath=True)

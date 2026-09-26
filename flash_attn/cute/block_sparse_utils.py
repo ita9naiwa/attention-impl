@@ -963,8 +963,14 @@ def softmax_block_sparse_sm100_list(
     check_m_boundary: bool,
     is_first_block: bool,
     allow_unmasked_inner_blocks: cutlass.Constexpr[bool],
+    full_inner_noop: cutlass.Constexpr[bool] = False,
 ):
-    """Run one reverse sparse list while masking only the first coarse KV fragment."""
+    """Run one reverse sparse list while masking only the first coarse KV fragment.
+
+    full_inner_noop: caller proved the inner callback is a score no-op (see
+    FlashAttentionForwardSm100.vc_full_inner_hwmax); inner steps then take the hardware max.
+    """
+    inner_kwargs = dict(full_inner_noop=True) if const_expr(full_inner_noop) else {}
     mask_fn_seqlen = partial(mask_fn_base, mask_seqlen=True, check_q_boundary=check_m_boundary)
     physical_n_block = partial(
         sparse_physical_n_block_forward, block_indices, kv_subtile_factor=kv_subtile_factor
@@ -1026,12 +1032,13 @@ def softmax_block_sparse_sm100_list(
             s0_s1_sequence_phase,
             physical_n_block(block_end - 1 - i),
             mask_fn=None
-            if const_expr(allow_unmasked_inner_blocks and check_m_boundary is False)
+            if const_expr(full_inner_noop or (allow_unmasked_inner_blocks and check_m_boundary is False))
             else partial(
                 mask_fn_base,
                 mask_seqlen=False,
                 check_q_boundary=check_m_boundary,
             ),
+            **inner_kwargs,
         )
 
     return mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase
@@ -1060,6 +1067,7 @@ def softmax_block_sparse_sm100(
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
     kv_subtile_factor: cutlass.Constexpr[int] = 1,
+    full_inner_noop: cutlass.Constexpr[bool] = False,
 ):
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
@@ -1133,6 +1141,7 @@ def softmax_block_sparse_sm100(
                 check_m_boundary,
                 split_mask_block_cnt == 0,
                 True,
+                full_inner_noop,
             )
 
     return (

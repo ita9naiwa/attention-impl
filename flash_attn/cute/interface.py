@@ -1275,6 +1275,7 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         use_clc_scheduler,
         utils._fa_kv_pingpong_enabled,
+        utils._fa_vc_full_inner_hwmax_enabled,
         num_splits_dynamic is not None,
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,

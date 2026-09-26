@@ -604,6 +604,13 @@ class FlashAttentionForwardSm100:
         # The next QK protects intermediate alpha; final stats still need an explicit drain.
         self.vc_sparse_stats_overlap = (self.vc_tc_sum and blocksparse_tensors is not None
                                         and not self.use_2cta_instrs and self.q_stage == 2)
+        # Opt-in. vc_sparse_stats_overlap implies vc_tc_sum (ExpCast, no V-Smooth, no causal/local/score_mod)
+        # and q_stage 2; the factor-1 checks pin sparse Q256 / physical KV128. The full-list callback is then
+        # apply_mask_sm100(mask_mod=None, mask_seqlen=False, no rBitmask): a score no-op even under a dynamic
+        # Q-boundary guard, so full-inner tiles may consume the ld.red row max.
+        self.vc_full_inner_hwmax = all((utils._fa_vc_full_inner_hwmax_enabled, self.vc_sparse_stats_overlap,
+                                        self.use_ldred_rowmax, self.q_subtile_factor == 1,
+                                        self.kv_subtile_factor == 1))
         self.vc_compact = all((self.vc_two_pass, self.use_tma_Q, self.use_tma_KV,
                                self.use_tma_O, not self.use_clc_scheduler,
                                self.is_persistent, self.qhead_per_kvhead == 1, self.q_subtile_factor == 1,
@@ -2642,6 +2649,8 @@ class FlashAttentionForwardSm100:
                     empty_tile,
                 ) = (
                     softmax_block_sparse_sm100_kv_pingpong if const_expr(self.kv_pingpong)
+                    else partial(softmax_block_sparse_sm100, full_inner_noop=True)
+                    if const_expr(self.vc_full_inner_hwmax)
                     else softmax_block_sparse_sm100
                 )(
                     blocksparse_tensors,
@@ -2817,6 +2826,7 @@ class FlashAttentionForwardSm100:
         pending_sum=None,
         pipeline_tc_sum=None,
         tmem_base: Int32 = Int32(0),
+        full_inner_noop: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2876,7 +2886,10 @@ class FlashAttentionForwardSm100:
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
         # Masked iterations reduce over post-mask values in software.
-        if const_expr(self.use_ldred_rowmax and mask_fn is None):
+        if const_expr(full_inner_noop):
+            # Proven no-op mask: hardware max, but keep update_row_max's fastmath alpha.
+            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first, row_max_local=hw_row_max)
+        elif const_expr(self.use_ldred_rowmax and mask_fn is None):
             row_max, acc_scale = softmax.update_row_max_precomputed(hw_row_max, is_first)
         else:
             row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
