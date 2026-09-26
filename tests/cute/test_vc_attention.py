@@ -552,7 +552,7 @@ def _vbs_vector_mask():
 
 @torch.no_grad()
 def test_full_inner_hwmax_exact():
-    """FA_VC_FULL_INNER_HWMAX must reproduce the default VC Q256 sparse kernel bit for bit."""
+    """FA_VC_FULL_INNER_HWMAX (default on) must reproduce the software-row-max VC Q256 sparse kernel (=0) bit for bit."""
     if torch.cuda.get_device_capability() != (10, 3):
         print("SKIP full-inner hwmax: requires SM103")
         return
