@@ -195,6 +195,7 @@ class VCScaleState:
 
     Margins default (None) to the entry point's own: PREPARE_MARGINS for prepare(), which accepts only those
     (compiled), and PREPARE_VSA_MARGINS for prepare_vsa(), which accepts any.
+    Unset margins stay None on the object (qk_margin/v_margin); margins(default) returns the resolved pair.
     """
 
     def __init__(self, qk_margin=None, v_margin=None):

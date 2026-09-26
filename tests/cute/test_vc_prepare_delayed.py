@@ -240,3 +240,26 @@ def test_shared_state_class_and_margins():
     )
     with pytest.raises(ValueError, match="compiled margins"):
         prepare(*x, smooth=False, bshd=True, scale_state=VCScaleState(1.5))
+
+
+def test_prepare_vsa_unset_margins_resolve_to_its_defaults():
+    # qk_margin/v_margin=None is resolved by the entry point: prepare_vsa() must still run with (1.5, 2.0).
+    from test_vc_vsa_preprocess import assert_same, make_inputs, run
+
+    torch.manual_seed(20260926)
+    values, m, s, qm = make_inputs(256, 128, torch.bfloat16, 2, 3)
+    out = {}
+    for name, state in (
+        ("unset", VCScaleState()),
+        ("explicit", VCScaleState(1.5, 2.0)),
+        ("other", VCScaleState(2.0, 2.0)),
+    ):
+        run(values, m, s, qm, 256, state)  # cold path + init
+        out[name] = run(
+            values, m, s, qm, 256, state
+        )  # warm path with the resolved margins
+    assert_same(out["unset"], out["explicit"])
+    with pytest.raises(
+        AssertionError
+    ):  # positive control: a different qk margin changes the warm-path bytes
+        assert_same(out["unset"], out["other"])
