@@ -44,19 +44,66 @@ def _library(device):
         _ok(nvrtc.nvrtcDestroyProgram(program))
     return native._load_module(
         ctypes.create_string_buffer(bytes(ptx)),
-        ("vsa_stats", "vsa_reduce", "vsa_quantize", "vsa_routes", "vsa_routes_sorted", "vsa_routes_warp"),
+        (
+            "vsa_stats",
+            "vsa_reduce",
+            "vsa_quantize",
+            "vsa_routes",
+            "vsa_routes_sorted",
+            "vsa_routes_warp",
+            "vsa_stats_delayed",
+            "vsa_check",
+            "vsa_requantize",
+        ),
     )
 
 
-def _launch(name, grid, threads, pointers, integers, stream):
+def _launch(name, grid, threads, pointers, integers, stream, floats=()):
+    """Kernel arguments are ordered pointers, floats, integers."""
     driver, _, functions = _library(torch.cuda.current_device())
-    values = [ctypes.c_void_p(x.data_ptr()) for x in pointers] + [ctypes.c_int(x) for x in integers]
+    values = (
+        [ctypes.c_void_p(x.data_ptr()) for x in pointers]
+        + [ctypes.c_float(x) for x in floats]
+        + [ctypes.c_int(x) for x in integers]
+    )
     args = (ctypes.c_void_p * len(values))(
         *[ctypes.cast(ctypes.byref(x), ctypes.c_void_p) for x in values]
     )
     native._check(
         driver.cuLaunchKernel(functions[name], *grid, threads, 1, 1, 0, stream, args, None), name
     )
+
+
+class VCScaleState:
+    """Caller-owned delayed-scaling state for prepare_vsa(): one per attention layer instance and stream.
+
+    Opt-in: used only when passed as scale_state. Holds the previous call's {kmean, qs, ks, vs} (statistics
+    only, never payload) in device buffers updated in place, plus int32 device counters. With a matching
+    state, prepare_vsa() reads each source row once, storing E4M3 with the state's scales times margins
+    (qk_margin for Q/K, v_margin for V) while computing this call's statistics and pools; every (b,h) whose
+    fresh range the used scales do not cover, or that shrank by more than 2x, is re-quantized on the device
+    with fresh scales (no host synchronization). An empty or mismatched state takes the unchanged cold path
+    and (re)initializes. Returned descales are the ones actually used and are independent of the state.
+    """
+
+    def __init__(self, qk_margin=1.5, v_margin=2.0):
+        self.signature = None
+        self.qk_margin, self.v_margin = float(qk_margin), float(v_margin)
+        self.fallbacks = None  # int32 device counter: (b,h) re-quantized with fresh scales
+        # int32 device counter: (block, channel, tensor) slabs over E4M3 range in attempted warm-path
+        # stores, including padded K slots and heads later overwritten by a fallback.
+        self.saturations = None
+
+    def _init(self, signature, kmean, qs, ks, vs):
+        if self.signature is not None and self.qs.shape == qs.shape and self.qs.device == qs.device:
+            for dst, src in zip((self.kmean, self.qs, self.ks, self.vs), (kmean, qs, ks, vs)):
+                dst.copy_(src)
+        else:
+            self.kmean, self.qs, self.ks, self.vs = kmean.clone(), qs.clone(), ks.clone(), vs.clone()
+        self.signature = signature
+        if self.fallbacks is None or self.fallbacks.device != qs.device:
+            self.fallbacks = torch.zeros((), device=qs.device, dtype=torch.int32)
+            self.saturations = torch.zeros((), device=qs.device, dtype=torch.int32)
 
 
 def prepare_vsa(
@@ -70,6 +117,7 @@ def prepare_vsa(
     padded_to_query,
     query_tokens,
     query_offset=0,
+    scale_state=None,
 ):
     """Return (FP8 prepared dict, FP32 pooled QKV) for one document.
 
@@ -77,6 +125,7 @@ def prepare_vsa(
     original indices address the full source tensors. Query map values use the
     caller's compact coordinate system and are rebased by query_offset. Mapping
     values/valid sizes are owned by H3 metadata; no host synchronization is added.
+    scale_state: optional caller-owned VCScaleState (delayed scaling); None keeps the cold path.
     """
     if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v)):
         raise ValueError("Fused VSA VC preparation is inference-only")
@@ -138,6 +187,42 @@ def prepare_vsa(
             (x.dtype == torch.int64) << i
             for i, x in enumerate((padded_to_original, padded_to_query, variable_block_sizes))
         )
+        signature = (q.device, q.dtype, b, h, d, block_size)
+        if scale_state is not None and scale_state.signature == signature:
+            st = scale_state
+            used_qs, used_ks = (torch.empty((b, h), **factory) for _ in range(2))
+            used_vs = torch.empty((b, h, d), **factory)
+            flag = torch.empty((b, h), device=q.device, dtype=torch.int32)
+            margins = (st.qk_margin, st.v_margin)
+            _launch(
+                "vsa_stats_delayed",
+                (blocks, h, b),
+                256,
+                [q, k, v, padded_to_original, padded_to_query, variable_block_sizes, stats, *pools,
+                 st.kmean, st.qs, st.ks, st.vs, oq, ok, ov, st.saturations],
+                [source_n, blocks, h, d, block_size, query_tokens, query_offset, dtype, metadata_mask],
+                stream,
+                margins,
+            )
+            _launch("vsa_reduce", (b * h, 1, 1), 1024, [stats, kmean, qs, ks, vs], [padded_n, d, blocks], stream)
+            _launch(
+                "vsa_check",
+                (b * h, 1, 1),
+                d,
+                [st.kmean, st.qs, st.ks, st.vs, kmean, qs, ks, vs, flag, used_qs, used_ks, used_vs, st.fallbacks],
+                [d],
+                stream,
+                margins,
+            )
+            _launch(
+                "vsa_requantize",
+                ((padded_n + 127) // 128, h, b),
+                128,
+                [q, k, v, padded_to_original, padded_to_query, kmean, qs, ks, vs, oq, ok, ov, flag],
+                [source_n, padded_n, query_tokens, query_offset, h, d, dtype, metadata_mask],
+                stream,
+            )
+            return {"q": oq, "k": ok, "v": ov, "qs": used_qs, "ks": used_ks, "vs": used_vs}, pools
         _launch(
             "vsa_stats",
             (blocks, h, b),
@@ -162,6 +247,8 @@ def prepare_vsa(
             [source_n, padded_n, query_tokens, query_offset, h, d, dtype, metadata_mask],
             stream,
         )
+        if scale_state is not None:
+            scale_state._init(signature, kmean, qs, ks, vs)
     return {"q": oq, "k": ok, "v": ov, "qs": qs, "ks": ks, "vs": vs}, pools
 
 

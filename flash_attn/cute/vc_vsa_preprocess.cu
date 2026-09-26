@@ -4,11 +4,16 @@ __device__ int64_t vsa_index(const void *p, int i, bool wide) {
     return wide ? ((const int64_t*)p)[i] : ((const int*)p)[i];
 }
 
-template<int D> __device__ void vsa_stats_impl(
+// DELAYED (caller-owned scale state): also store the padded E4M3 Q/K/V with the state's scales x margins,
+// using vsa_quantize's per-element math and indexing; statistics and pools use the identical code path.
+template<int D, bool DELAYED=false> __device__ void vsa_stats_impl(
     const void *q, const void *k, const void *v, const void *source_map,
     const void *query_map, const void *sizes, float *stats,
     float *pq, float *pk, float *pv, int source_n, int nblocks, int h,
-    int block_size, int query_n, int query_offset, int dtype, int metadata_mask, float scale) {
+    int block_size, int query_n, int query_offset, int dtype, int metadata_mask, float scale,
+    const float *skmean=nullptr, const float *sqs=nullptr, const float *sks=nullptr, const float *svs=nullptr,
+    uint8_t *oq=nullptr, uint8_t *ok=nullptr, uint8_t *ov=nullptr, int *saturated=nullptr,
+    float qk_margin=1.f, float v_margin=1.f) {
     constexpr int W = D/32;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     int block = blockIdx.x, head = blockIdx.y, batch = blockIdx.z, bh = batch*h+head;
@@ -25,7 +30,7 @@ template<int D> __device__ void vsa_stats_impl(
         bool valid = original >= 0 && original < source_n;
         bool query_valid = qi >= 0 && qi < query_n;
         int64_t base = (((int64_t)batch*source_n+original)*h+head)*D;
-        float qr[W], kr[W];
+        float qr[W], kr[W], vr[W];
         if constexpr(D==128){
             float rawq[W], rawk[W], rawv[W];
             if(valid){
@@ -42,6 +47,7 @@ template<int D> __device__ void vsa_stats_impl(
                 a[5][j] += qv; a[6][j] += kv; a[7][j] += vv;
                 a[4][j] = fmaxf(a[4][j], fabsf(vv));
                 qr[j] = query_valid ? qv : 0; kr[j] = kv;
+                if constexpr(DELAYED) vr[j] = vv;
             }
         }else{
             // Preserve scalar load/consume order for short D64 inputs.
@@ -54,6 +60,7 @@ template<int D> __device__ void vsa_stats_impl(
                 a[5][j] += qv; a[6][j] += kv; a[7][j] += vv;
                 a[4][j] = fmaxf(a[4][j], fabsf(vv));
                 qr[j] = query_valid ? qv : 0; kr[j] = kv;
+                if constexpr(DELAYED) vr[j] = vv;
             }
         }
         rotate_contiguous<D>(qr,kr,scale);
@@ -62,6 +69,25 @@ template<int D> __device__ void vsa_stats_impl(
             a[0][j] += kr[j];
             a[1][j] = fminf(a[1][j],kr[j]); a[2][j] = fmaxf(a[2][j],kr[j]);
             a[3][j] = fmaxf(a[3][j],fabsf(qr[j]));
+        }
+        if constexpr(DELAYED) {
+            int c=lane*W;
+            float uq=sqs[bh]*qk_margin, uk=sks[bh]*qk_margin;
+            #pragma unroll
+            for (int j=0; j<W; ++j) {
+                qr[j]/=uq; kr[j]=(kr[j]-skmean[bh*D+c+j])/uk; vr[j]/=svs[bh*D+c+j]*v_margin;
+            }
+            int64_t dst=(((int64_t)batch*nblocks*block_size+padded)*h+head)*D+c;
+            int64_t qdst=(((int64_t)batch*query_n+qi)*h+head)*D+c;
+            if constexpr(D==128) {
+                if(query_valid) *(unsigned int*)(oq+qdst)=to_fp8_four(qr[0],qr[1],qr[2],qr[3]);
+                *(unsigned int*)(ok+dst)=to_fp8_four(kr[0],kr[1],kr[2],kr[3]);
+                *(unsigned int*)(ov+dst)=to_fp8_four(vr[0],vr[1],vr[2],vr[3]);
+            } else {
+                if(query_valid) *(unsigned short*)(oq+qdst)=to_fp8_two(qr[0],qr[1]);
+                *(unsigned short*)(ok+dst)=to_fp8_two(kr[0],kr[1]);
+                *(unsigned short*)(ov+dst)=to_fp8_two(vr[0],vr[1]);
+            }
         }
     }
     __shared__ float partial[8][8][D];
@@ -95,6 +121,12 @@ template<int D> __device__ void vsa_stats_impl(
         // Match Triton pooling division: tiny rounding changes can flip near-tied top-k routes.
         float inverse; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(inverse) : "f"(divisor));
         pq[out]=sums[5]*inverse; pk[out]=sums[6]*inverse; pv[out]=sums[7]*inverse;
+        if constexpr(DELAYED) {  // one compare per (block, channel, tensor) from the block maxima
+            float km=skmean[bh*D+c];
+            int over=(sums[3]>448.f*sqs[bh]*qk_margin)+(sums[4]>448.f*svs[bh*D+c]*v_margin)
+                    +(fmaxf(fabsf(sums[1]-km),fabsf(sums[2]-km))>448.f*sks[bh]*qk_margin);
+            if(over) atomicAdd(saturated,over);
+        }
     }
 }
 
@@ -107,13 +139,24 @@ extern "C" __global__ void vsa_stats(
     else vsa_stats_impl<128>(q,k,v,source_map,query_map,sizes,stats,pq,pk,pv,source_n,nblocks,h,block_size,query_n,query_offset,dtype,metadata_mask,scale);
 }
 
-template<int D> __device__ void vsa_quantize_impl(
+// Warm path: vsa_stats plus E4M3 stores with the state's scales x margins (one read of each source row).
+extern "C" __global__ __launch_bounds__(256, 3) void vsa_stats_delayed(
+    const void *q,const void *k,const void *v,const void *source_map,
+    const void *query_map,const void *sizes,float *stats,float *pq,float *pk,float *pv,
+    const float *skmean,const float *sqs,const float *sks,const float *svs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
+    int *saturated,float qk_margin,float v_margin,
+    int source_n,int nblocks,int h,int d,int block_size,int query_n,int query_offset,int dtype,int metadata_mask) {
+    float scale=rsqrtf((float)d);
+    if(d==64) vsa_stats_impl<64,true>(q,k,v,source_map,query_map,sizes,stats,pq,pk,pv,source_n,nblocks,h,block_size,query_n,query_offset,dtype,metadata_mask,scale,skmean,sqs,sks,svs,oq,ok,ov,saturated,qk_margin,v_margin);
+    else vsa_stats_impl<128,true>(q,k,v,source_map,query_map,sizes,stats,pq,pk,pv,source_n,nblocks,h,block_size,query_n,query_offset,dtype,metadata_mask,scale,skmean,sqs,sks,svs,oq,ok,ov,saturated,qk_margin,v_margin);
+}
+
+template<int D> __device__ __forceinline__ void vsa_quantize_token(
     const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
     const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
-    int source_n,int padded_n,int query_n,int query_offset,int h,int dtype,int metadata_mask,float scale) {
+    int source_n,int padded_n,int query_n,int query_offset,int h,int dtype,int metadata_mask,float scale,int token) {
     constexpr int W=D/32;
-    int lane=threadIdx.x%32, token=blockIdx.x*4+threadIdx.x/32;
-    if(token>=padded_n) return;
+    int lane=threadIdx.x%32;
     int head=blockIdx.y,batch=blockIdx.z,bh=batch*h+head,c=lane*W;
     int64_t original=vsa_index(source_map,token,metadata_mask&1), qi=vsa_index(query_map,token,metadata_mask&2)-query_offset;
     bool valid=original>=0 && original<source_n;
@@ -159,6 +202,15 @@ template<int D> __device__ void vsa_quantize_impl(
     }
 }
 
+template<int D> __device__ void vsa_quantize_impl(
+    const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
+    const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
+    int source_n,int padded_n,int query_n,int query_offset,int h,int dtype,int metadata_mask,float scale) {
+    int token=blockIdx.x*4+threadIdx.x/32;
+    if(token>=padded_n) return;
+    vsa_quantize_token<D>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale,token);
+}
+
 extern "C" __global__ void vsa_quantize(
     const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
     const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
@@ -166,6 +218,48 @@ extern "C" __global__ void vsa_quantize(
     float scale=rsqrtf((float)d);
     if(d==64) vsa_quantize_impl<64>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale);
     else vsa_quantize_impl<128>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale);
+}
+
+// Fallback: vsa_quantize's per-token math with fresh scales for flagged (b,h) only; 128 tokens per CTA,
+// unflagged heads exit immediately.
+extern "C" __global__ void vsa_requantize(
+    const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
+    const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
+    const int *flag,int source_n,int padded_n,int query_n,int query_offset,int h,int d,int dtype,int metadata_mask) {
+    if(!flag[blockIdx.z*h+blockIdx.y]) return;
+    float scale=rsqrtf((float)d);
+    int end=min(padded_n,(int)blockIdx.x*128+128);
+    for(int token=blockIdx.x*128+threadIdx.x/32; token<end; token+=4) {
+        if(d==64) vsa_quantize_token<64>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale,token);
+        else vsa_quantize_token<128>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale,token);
+    }
+}
+
+// Per (b,h): the used scales (state x margin) must cover this call's fresh ranges (K bound via
+// |k-kmean_state| <= |k-kmean_fresh| + |kmean_fresh-kmean_state|) and not exceed 2x the steady-state ratio
+// (used <= 2*margin*fresh); otherwise flag the head for fresh requantization. Writes the descales actually
+// used, then copies the fresh statistics into the state in place. One CTA of d threads per (b,h).
+extern "C" __global__ void vsa_check(float *skmean,float *sqs,float *sks,float *svs,const float *fkmean,
+    const float *fqs,const float *fks,const float *fvs,int *flag,float *oqs,float *oks,float *ovs,int *fallbacks,
+    float qk_margin,float v_margin,int d) {
+    int bh=blockIdx.x,c=threadIdx.x; __shared__ int bad; __shared__ float shift[128];
+    if(c==0) bad=0;
+    __syncthreads();
+    float uv=svs[bh*d+c]*v_margin,fv=fvs[bh*d+c];
+    shift[c]=fabsf(fkmean[bh*d+c]-skmean[bh*d+c]);
+    if(fv>uv||uv>2.f*v_margin*fv) atomicOr(&bad,1);
+    __syncthreads();
+    if(c==0){
+        float ms=0; for(int j=0;j<d;++j) ms=fmaxf(ms,shift[j]);
+        float uq=sqs[bh]*qk_margin,uk=sks[bh]*qk_margin,kneed=fks[bh]+ms/448.f;
+        if(fqs[bh]>uq||uq>2.f*qk_margin*fqs[bh]||kneed>uk||uk>2.f*qk_margin*fks[bh]) bad=1;
+        flag[bh]=bad; if(bad) atomicAdd(fallbacks,1);
+        oqs[bh]=bad?fqs[bh]:uq; oks[bh]=bad?fks[bh]:uk;
+    }
+    __syncthreads();
+    ovs[bh*d+c]=bad?fv:uv;
+    svs[bh*d+c]=fv; skmean[bh*d+c]=fkmean[bh*d+c];
+    if(c==0){sqs[bh]=fqs[bh]; sks[bh]=fks[bh];}
 }
 
 extern "C" __global__ void vsa_reduce(const float *stats, float *kmean,
