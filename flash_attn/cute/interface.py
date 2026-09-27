@@ -356,10 +356,9 @@ def _get_fwd_config(
     seqlen_q_packgqa = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
     if arch // 10 in [10, 11]:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
-        # A block-sparse Q block of a single tile (e.g. a VSA-128 map) cannot be shared by two Q stages: the kernel
-        # needs each sparse Q block to cover the CTA's q_stage * tile_m rows. Run one stage instead of rejecting it.
-        sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
-        if sparse_q is not None and sparse_q < 2 * tile_m:
+        # A 128-row block-sparse Q block (a VSA-128 map) cannot be shared by two 128-row Q stages: the kernel needs
+        # each sparse Q block to cover the CTA's q_stage * tile_m rows. Run one stage instead of rejecting it.
+        if tile_m == 128 and get_sparse_q_block_size(block_sparse_tensors, seqlen_q) == 128:
             q_stage = 1
     else:
         q_stage = 1
