@@ -91,12 +91,9 @@ template<int D> __device__ void vsa_stats_impl(
         };
         uint2 qb, kb, vb; bool query_valid;
         fetch(warp,qb,kb,vb,query_valid);  // block_size >= 128 > warp
-        // Loop control on r0 only (block_size is a multiple of 8), so it is provably warp-uniform and the rotate's
-        // shuffles need no collective fallback; each warp still takes rows warp, warp+8, ... in order.
-        for (int r0=0; r0<block_size; r0+=8) {
-            int row=r0+warp;
+        for (int row=warp; row<block_size; row+=8) {
             uint2 nq=make_uint2(0,0), nk=nq, nv=nq; bool nvalid=false;
-            if (r0+8<block_size) fetch(row+8,nq,nk,nv,nvalid);
+            if (row+8<block_size) fetch(row+8,nq,nk,nv,nvalid);
             float rawq[W]={__uint_as_float(qb.x<<16),__uint_as_float(qb.x&0xffff0000u),__uint_as_float(qb.y<<16),__uint_as_float(qb.y&0xffff0000u)};
             float rawk[W]={__uint_as_float(kb.x<<16),__uint_as_float(kb.x&0xffff0000u),__uint_as_float(kb.y<<16),__uint_as_float(kb.y&0xffff0000u)};
             float rawv[W]={__uint_as_float(vb.x<<16),__uint_as_float(vb.x&0xffff0000u),__uint_as_float(vb.y<<16),__uint_as_float(vb.y&0xffff0000u)};
@@ -105,8 +102,8 @@ template<int D> __device__ void vsa_stats_impl(
         }
     }
     }
-    for (int r0=0; !prefetch && r0<block_size; r0+=8) {
-        int row = r0+warp, padded = block*block_size+row;
+    for (int row=warp; !prefetch && row<block_size; row+=8) {
+        int padded = block*block_size+row;
         int64_t original = vsa_index(source_map,padded,metadata_mask&1), qi = vsa_index(query_map,padded,metadata_mask&2)-query_offset;
         bool valid = original >= 0 && original < source_n;
         bool query_valid = qi >= 0 && qi < query_n;
