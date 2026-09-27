@@ -55,6 +55,11 @@ def _library(device):
     )
 
 
+@functools.cache
+def _sm_count(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def _launch(name, grid, threads, pointers, integers, stream):
     """Kernel arguments are ordered pointers, integers."""
     driver, _, functions = _library(torch.cuda.current_device())
@@ -164,7 +169,7 @@ def prepare_vsa(
         )
         _launch(
             "vsa_quantize",
-            ((padded_n + 3) // 4, h, b),
+            (min((padded_n + 3) // 4, 4 * _sm_count(q.device)), h, b),
             128,
             [q, k, v, padded_to_original, padded_to_query, kmean, qs, ks, vs, oq, ok, ov],
             [source_n, padded_n, query_tokens, query_offset, h, d, dtype, metadata_mask],

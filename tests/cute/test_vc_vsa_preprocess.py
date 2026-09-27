@@ -374,6 +374,46 @@ def test_vsa_stats_grouped_loads_raw_bytes():
     print("changed-input eager and graph replay raw-byte parity PASS", flush=True)
 
 
+@contextlib.contextmanager
+def sm_count(n):
+    saved = vsa._sm_count
+    vsa._sm_count = lambda device: n
+    try:
+        yield
+    finally:
+        vsa._sm_count = saved
+
+
+@torch.no_grad()
+def test_vsa_producer_prefetch_raw_bytes():
+    """Aligned BF16 D128 (prefetching stats rows, grid-stride quantize with register scales) vs the same values with
+    one misaligned tensor, which takes the per-row read_qkv_contiguous / per-token vsa_quantize_token code."""
+    torch.manual_seed(20260927)
+    torch.zeros(1, device="cuda")
+
+    def pair(values, m, s, qm, block, query_tokens=None):
+        assert all(x.data_ptr() % 8 == 0 for x in values)
+        slow = [placed(x, o) for x, o in zip(values, (0, 0, 1))]
+        return snapshot(run(values, m, s, qm, block, query_tokens)), snapshot(run(slow, m, s, qm, block, query_tokens))
+
+    metadata = list(itertools.product((torch.int32, torch.int64), repeat=3))
+    # SM counts 1/5/7 make the quantize grid 4/20/28 CTAs: many grid-stride steps, and with 5/7 a partial last
+    # stride (padded_n % (16 * sms) != 0); None keeps the device count.
+    for sms, block, kind in itertools.product((None, 1, 5, 7), (128, 256), ("normal", "finite", "nonfinite")):
+        with sm_count(sms) if sms else contextlib.nullcontext():
+            for mix in metadata[:: 3 if sms else 1]:
+                values, m, s, qm = make_inputs(block, 128, torch.bfloat16, 2, 3, mix)
+                values = [special(x, kind) for x in values]
+                assert_raw(*pair(values, m, s, qm, block), (sms, block, kind, mix))
+            assert_raw(*pair(values, m, s, torch.full_like(qm, -1), block, 0), (sms, block, kind, "no queries"))
+    values, m, s, qm, nq = canonical_like(tiles=41)  # padded_n 10496: several strides at the device count
+    for sms in (None, 3):
+        with sm_count(sms) if sms else contextlib.nullcontext():
+            assert_raw(*pair(values, m, s, qm, 256, nq), ("canonical", sms))
+    print("producer prefetch raw-byte parity PASS", flush=True)
+
+
 if __name__ == "__main__":
     test_vsa_preparation()
     test_vsa_stats_grouped_loads_raw_bytes()
+    test_vsa_producer_prefetch_raw_bytes()

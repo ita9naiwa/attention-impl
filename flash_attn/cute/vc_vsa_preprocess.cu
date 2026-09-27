@@ -54,13 +54,60 @@ template<int D> __device__ void vsa_stats_impl(
         for (int m=0; m<8; ++m) a[m][j] = 0;
         a[1][j] = INFINITY; a[2][j] = -INFINITY;
     }
-    for (int row=warp; row<block_size; row+=8) {
+    // One row's accumulation; the BF16 prefetch loop and the generic loop share it, so the per-warp order is identical.
+    auto accumulate=[&](const float (&rawq)[W], const float (&rawk)[W], const float (&rawv)[W], bool query_valid) {
+        float qr[W], kr[W];
+        #pragma unroll
+        for (int j=0; j<W; ++j) {
+            float qv=rawq[j],kv=rawk[j],vv=rawv[j];
+            a[5][j] += qv; a[6][j] += kv; a[7][j] += vv;
+            a[4][j] = fmaxf(a[4][j], fabsf(vv));
+            qr[j] = query_valid ? qv : 0; kr[j] = kv;
+        }
+        rotate_contiguous<D>(qr,kr,scale);
+        #pragma unroll
+        for (int j=0; j<W; ++j) {
+            a[0][j] += kr[j];
+            a[1][j] = fminf(a[1][j],kr[j]); a[2][j] = fmaxf(a[2][j],kr[j]);
+            a[3][j] = fmaxf(a[3][j],fabsf(qr[j]));
+        }
+    };
+    bool prefetch = false;
+    if constexpr(D==128) {
+    prefetch = dtype==0 && ((((unsigned long long)q)|((unsigned long long)k)|((unsigned long long)v))&7)==0;
+    if (prefetch) {
+        // BF16 D128, 8B-aligned (every lane offset is a multiple of 4 elements): load row+8 while rotating row.
+        auto fetch=[&](int row, uint2 &qb, uint2 &kb, uint2 &vb, bool &query_valid) {
+            int padded = block*block_size+row;
+            int64_t original = vsa_index(source_map,padded,metadata_mask&1), qi = vsa_index(query_map,padded,metadata_mask&2)-query_offset;
+            query_valid = qi >= 0 && qi < query_n;
+            qb = kb = vb = make_uint2(0,0);
+            if (original >= 0 && original < source_n) {
+                int64_t base = (((int64_t)batch*source_n+original)*h+head)*D+lane*W;
+                qb=*((const uint2*)((const unsigned short*)q+base));
+                kb=*((const uint2*)((const unsigned short*)k+base));
+                vb=*((const uint2*)((const unsigned short*)v+base));
+            }
+        };
+        uint2 qb, kb, vb; bool query_valid;
+        fetch(warp,qb,kb,vb,query_valid);  // block_size >= 128 > warp
+        for (int row=warp; row<block_size; row+=8) {
+            uint2 nq=make_uint2(0,0), nk=nq, nv=nq; bool nvalid=false;
+            if (row+8<block_size) fetch(row+8,nq,nk,nv,nvalid);
+            float rawq[W]={__uint_as_float(qb.x<<16),__uint_as_float(qb.x&0xffff0000u),__uint_as_float(qb.y<<16),__uint_as_float(qb.y&0xffff0000u)};
+            float rawk[W]={__uint_as_float(kb.x<<16),__uint_as_float(kb.x&0xffff0000u),__uint_as_float(kb.y<<16),__uint_as_float(kb.y&0xffff0000u)};
+            float rawv[W]={__uint_as_float(vb.x<<16),__uint_as_float(vb.x&0xffff0000u),__uint_as_float(vb.y<<16),__uint_as_float(vb.y&0xffff0000u)};
+            accumulate(rawq,rawk,rawv,query_valid);
+            qb=nq; kb=nk; vb=nv; query_valid=nvalid;
+        }
+    }
+    }
+    for (int row=warp; !prefetch && row<block_size; row+=8) {
         int padded = block*block_size+row;
         int64_t original = vsa_index(source_map,padded,metadata_mask&1), qi = vsa_index(query_map,padded,metadata_mask&2)-query_offset;
         bool valid = original >= 0 && original < source_n;
         bool query_valid = qi >= 0 && qi < query_n;
         int64_t base = (((int64_t)batch*source_n+original)*h+head)*D;
-        float qr[W], kr[W];
         if constexpr(D==128){
             float rawq[W], rawk[W], rawv[W];
             if(valid){
@@ -69,14 +116,9 @@ template<int D> __device__ void vsa_stats_impl(
                 #pragma unroll
                 for(int j=0;j<W;++j){rawq[j]=0;rawk[j]=0;rawv[j]=0;}
             }
-            #pragma unroll
-            for (int j=0; j<W; ++j) {
-                float qv=rawq[j],kv=rawk[j],vv=rawv[j];
-                a[5][j] += qv; a[6][j] += kv; a[7][j] += vv;
-                a[4][j] = fmaxf(a[4][j], fabsf(vv));
-                qr[j] = query_valid ? qv : 0; kr[j] = kv;
-            }
+            accumulate(rawq,rawk,rawv,query_valid);
         }else{
+            float qr[W], kr[W];
             // Preserve scalar load/consume order for short D64 inputs.
             #pragma unroll
             for (int j=0; j<W; ++j) {
@@ -88,13 +130,13 @@ template<int D> __device__ void vsa_stats_impl(
                 a[4][j] = fmaxf(a[4][j], fabsf(vv));
                 qr[j] = query_valid ? qv : 0; kr[j] = kv;
             }
-        }
-        rotate_contiguous<D>(qr,kr,scale);
-        #pragma unroll
-        for (int j=0; j<W; ++j) {
-            a[0][j] += kr[j];
-            a[1][j] = fminf(a[1][j],kr[j]); a[2][j] = fmaxf(a[2][j],kr[j]);
-            a[3][j] = fmaxf(a[3][j],fabsf(qr[j]));
+            rotate_contiguous<D>(qr,kr,scale);
+            #pragma unroll
+            for (int j=0; j<W; ++j) {
+                a[0][j] += kr[j];
+                a[1][j] = fminf(a[1][j],kr[j]); a[2][j] = fmaxf(a[2][j],kr[j]);
+                a[3][j] = fmaxf(a[3][j],fabsf(qr[j]));
+            }
         }
     }
     __shared__ float partial[8][8][D];
@@ -131,7 +173,7 @@ template<int D> __device__ void vsa_stats_impl(
     }
 }
 
-extern "C" __global__ void vsa_stats(
+extern "C" __global__ void __launch_bounds__(256,4) vsa_stats(
     const void *q,const void *k,const void *v,const void *source_map,
     const void *query_map,const void *sizes,float *stats,float *pq,float *pk,float *pv,
     int source_n,int nblocks,int h,int d,int block_size,int query_n,int query_offset,int dtype,int metadata_mask) {
@@ -195,9 +237,52 @@ template<int D> __device__ void vsa_quantize_impl(
     const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
     const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
     int source_n,int padded_n,int query_n,int query_offset,int h,int dtype,int metadata_mask,float scale) {
-    int token=blockIdx.x*4+threadIdx.x/32;
-    if(token>=padded_n) return;
-    vsa_quantize_token<D>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale,token);
+    // Grid-stride over tokens (grid.x is capped at 4 x SMs by the launcher); a warp owns every gridDim.x*4-th token.
+    int token=blockIdx.x*4+threadIdx.x/32, stride=gridDim.x*4;
+    if constexpr(D==128) {
+        if(dtype==0 && ((((unsigned long long)q)|((unsigned long long)k)|((unsigned long long)v))&7)==0) {
+            // BF16, 8B-aligned: (b,h) scales held in registers, next token's loads issued before this token's rotate.
+            int lane=threadIdx.x%32, head=blockIdx.y, batch=blockIdx.z, bh=batch*h+head, c=lane*4;
+            float qscale=qs[bh], kscale=ks[bh], km[4], vscale[4];
+            #pragma unroll
+            for(int j=0;j<4;++j){km[j]=kmean[bh*D+c+j]; vscale[j]=vs[bh*D+c+j];}
+            auto fetch=[&](int t, uint2 &qb, uint2 &kb, uint2 &vb, int64_t &qi, bool &query_valid) {
+                int64_t original=vsa_index(source_map,t,metadata_mask&1);
+                qi=vsa_index(query_map,t,metadata_mask&2)-query_offset;
+                query_valid=qi>=0 && qi<query_n;
+                qb=kb=vb=make_uint2(0,0);
+                if(original>=0 && original<source_n) {
+                    int64_t src=(((int64_t)batch*source_n+original)*h+head)*D+c;
+                    kb=*((const uint2*)((const unsigned short*)k+src));
+                    vb=*((const uint2*)((const unsigned short*)v+src));
+                    if(query_valid) qb=*((const uint2*)((const unsigned short*)q+src));
+                }
+            };
+            if(token>=padded_n) return;
+            uint2 qb,kb,vb; int64_t qi; bool query_valid;
+            fetch(token,qb,kb,vb,qi,query_valid);
+            for(;;) {
+                bool more=stride<padded_n-token;
+                uint2 nq=make_uint2(0,0),nk=nq,nv=nq; int64_t nqi=0; bool nvalid=false;
+                if(more) fetch(token+stride,nq,nk,nv,nqi,nvalid);
+                float qr[4]={__uint_as_float(qb.x<<16),__uint_as_float(qb.x&0xffff0000u),__uint_as_float(qb.y<<16),__uint_as_float(qb.y&0xffff0000u)};
+                float kr[4]={__uint_as_float(kb.x<<16),__uint_as_float(kb.x&0xffff0000u),__uint_as_float(kb.y<<16),__uint_as_float(kb.y&0xffff0000u)};
+                float vr[4]={__uint_as_float(vb.x<<16),__uint_as_float(vb.x&0xffff0000u),__uint_as_float(vb.y<<16),__uint_as_float(vb.y&0xffff0000u)};
+                rotate_contiguous<D,true>(qr,kr,scale);
+                #pragma unroll
+                for(int j=0;j<4;++j) {qr[j]/=qscale; kr[j]=(kr[j]-km[j])/kscale; vr[j]/=vscale[j];}
+                int64_t dst=(((int64_t)batch*padded_n+token)*h+head)*D+c;
+                int64_t qdst=(((int64_t)batch*query_n+qi)*h+head)*D+c;
+                if(query_valid) *(unsigned int*)(oq+qdst)=to_fp8_four(qr[0],qr[1],qr[2],qr[3]);
+                *(unsigned int*)(ok+dst)=to_fp8_four(kr[0],kr[1],kr[2],kr[3]);
+                *(unsigned int*)(ov+dst)=to_fp8_four(vr[0],vr[1],vr[2],vr[3]);
+                if(!more) return;
+                token+=stride; qb=nq; kb=nk; vb=nv; qi=nqi; query_valid=nvalid;
+            }
+        }
+    }
+    for(;token<padded_n;token+=stride)
+        vsa_quantize_token<D>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale,token);
 }
 
 extern "C" __global__ void vsa_quantize(
