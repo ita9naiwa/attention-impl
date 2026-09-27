@@ -896,7 +896,7 @@ class FlashAttentionForwardSm100:
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
             blocks_to_batch_idx_ptr=mBlocksToBatchIdx,
             tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
-            # Grid alias guard for the block-sparse Q256 1-CTA static persistent forward: opt-in (alias_guard_hint True)
+            # Grid alias guard for the block-sparse Q256/Q128 1-CTA static persistent forward: opt-in (alias_guard_hint True)
             # only; the caller knows whether rows are imbalanced (H3 dense prefix). None/False keep the SM-count grid.
             alias_guard=TileScheduler is StaticPersistentTileScheduler
             and blocksparse_tensors is not None
@@ -905,7 +905,7 @@ class FlashAttentionForwardSm100:
             and mCuSeqlensQ is None
             and mSeqUsedQ is None
             and self.cluster_shape_mn == (1, 1)
-            and self.cta_tiler[0] == 256,
+            and self.cta_tiler[0] in (128, 256),  # Q256 (q_stage 2) or the single-stage Q128 kernel
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode

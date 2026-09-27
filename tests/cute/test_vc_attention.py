@@ -693,9 +693,10 @@ def test_full_inner_hwmax_exact():
 
 
 def test_alias_guard_hint_exact():
-    """alias_guard hint (None/True/False) on the block-sparse Q256 forward, BF16 and VC ExpCast: out/LSE bit-identical.
+    """alias_guard hint (None/True/False) on the block-sparse Q256 forward and the single-stage Q128 forward (128-row
+    sparse Q blocks), BF16 and VC ExpCast: out/LSE bit-identical.
 
-    The guard only shrinks the persistent grid (148 -> 146 CTAs on B300) when the Q256 block count and the SM count divide
+    The guard only shrinks the persistent grid (148 -> 146 CTAs on B300) when the Q-block count and the SM count divide
     each other. Only True engages it (None/False keep the SM-count grid). Q = 37/74/148 alias, Q = 150 is the control.
     """
     if torch.cuda.get_device_capability() != (10, 3):
@@ -727,9 +728,9 @@ def test_alias_guard_hint_exact():
         assert len(grids) == 1, grids
         return grids.pop()
 
-    for vc in (False, True):
+    for q_tile, vc in [(t, c) for t in (256, 128) for c in (False, True)]:
         for q_blocks in (37, 74, 148, 150):
-            sq = q_blocks * 256
+            sq = q_blocks * q_tile
             torch.manual_seed(q_blocks)
             if vc:
                 q, k, v = [(torch.randn(1, n, heads, 128, device="cuda") * 120).clamp(-448, 448).to(torch.float8_e4m3fn)
@@ -745,8 +746,9 @@ def test_alias_guard_hint_exact():
                 return sel.sum(-1, dtype=torch.int32)[None].contiguous(), idx.masked_fill(idx == nk, 0).to(torch.int32)[None].contiguous()
 
             (mc, mi), (fc, fi) = packed(selected & (aux < 128) & (aux > 0)), packed(selected & (aux == 128))
-            sparse = BlockSparseTensorsTorch(mc, mi, fc, fi, block_size=(256, 128))
+            sparse = BlockSparseTensorsTorch(mc, mi, fc, fi, block_size=(q_tile, 128))
             aliased = q_blocks % sm == 0 or sm % q_blocks == 0
+            case = (q_tile, "vc" if vc else "bf16", q_blocks)
             results = {}
             for hint in (None, True, False):
                 def run():
@@ -757,11 +759,12 @@ def test_alias_guard_hint_exact():
                 results[hint] = [t.clone() for t in run()]
                 engaged = aliased and hint is True
                 grid = fwd_grid(run)
-                assert grid == (sm - 2 if engaged else sm), (vc, q_blocks, hint, grid)
+                assert grid == (sm - 2 if engaged else sm), (case, hint, grid)
             for hint in (True, False):
-                assert all(torch.equal(a, b) for a, b in zip(results[None], results[hint])), (vc, q_blocks, hint)
+                pairs = zip(results[None], results[hint])
+                assert all(torch.equal(a, b) for a, b in pairs), (case, hint)
             assert torch.isfinite(results[None][0].float()).all()
-            print("alias guard hint exact", "vc" if vc else "bf16", q_blocks, flush=True)
+            print("alias guard hint exact", *case, flush=True)
     print("PASS alias guard hint: BF16 and VC out/LSE bit-identical across None/True/False", flush=True)
 
 
