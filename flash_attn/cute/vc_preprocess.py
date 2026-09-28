@@ -136,8 +136,10 @@ def prepare(q, k, v, permutation=None, smooth=True, hadamard=True, bshd=False):
     synchronization-free and always performed.
     """
     if smooth or permutation is not None or not hadamard:
-        raise NotImplementedError("prepare() supports only smooth=False, permutation=None, hadamard=True "
-                                  "(V-Smooth, permutation and the unrotated path were removed)")
+        raise NotImplementedError(
+            "prepare() supports only smooth=False, permutation=None, hadamard=True "
+            "(V-Smooth, permutation and the unrotated path were removed)"
+        )
     if q.ndim != 4 or min(q.shape) < 1 or q.shape[-1] not in (64, 128):
         raise ValueError("expected nonempty 4D input with D=64/128")
     if not q.is_cuda or q.dtype not in (torch.bfloat16, torch.float16, torch.float32):
@@ -170,7 +172,14 @@ def prepare(q, k, v, permutation=None, smooth=True, hadamard=True, bshd=False):
             [n, d, nb, h, dtype, dtype, 0, int(bshd), int(bshd)],
             stream,
         )
-        _launch("reduce_stats", b * h, 128 if nb == 1 else 1024, [stats, kmean, qs, ks, vs], [n, d, nb], stream)
+        _launch(
+            "reduce_stats",
+            b * h,
+            128 if nb == 1 else 1024,
+            [stats, kmean, qs, ks, vs],
+            [n, d, nb],
+            stream,
+        )
         _launch(
             "fused_quantize",
             ((n + 7) // 8, h, b),
