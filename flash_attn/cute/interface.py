@@ -599,7 +599,6 @@ def _flash_attn_fwd(
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
     vc_expcast: bool = False,
-    vc_mean: Optional[torch.Tensor] = None,
     vc_vscale: Optional[torch.Tensor] = None,
     vc_vbs128: bool = False,
     alias_guard: Optional[bool] = None,
@@ -817,21 +816,13 @@ def _flash_attn_fwd(
         assert not causal and window_size_left is None and window_size_right is None
         assert num_splits == 1 and score_mod is None and page_table is None
         assert mask_mod is None or block_sparse_tensors is not None
-    if vc_mean is not None or vc_vscale is not None:
+    if vc_vscale is not None:
         assert is_fp8 and arch // 10 == 10 and head_dim_v in (64,128)
         assert not causal and window_size_left is None and window_size_right is None
         assert num_splits == 1 and score_mod is None and page_table is None
         assert mask_mod is None or block_sparse_tensors is not None
         assert cu_seqlens_q is None and cu_seqlens_k is None
-        if vc_mean is not None:
-            assert block_sparse_tensors is None and mask_mod is None, "V-Smooth requires dense attention"
-            assert vc_mean.dtype in (torch.bfloat16, torch.float32), 'vc_mean must be BF16 or FP32'
-            _validate_tensor(vc_mean, 'vc_mean', (batch_size,num_head_kv,(seqlen_k+127)//128,head_dim_v),vc_mean.dtype,device)
-            assert vc_mean.is_contiguous()
-            if not is_fake_mode():
-                assert vc_mean.data_ptr() % 16 == 0
-        if vc_vscale is not None:
-            _validate_tensor(vc_vscale, 'vc_vscale', (batch_size,num_head_kv,head_dim_v),torch.float32,device)
+        _validate_tensor(vc_vscale, 'vc_vscale', (batch_size,num_head_kv,head_dim_v),torch.float32,device)
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
@@ -928,8 +919,6 @@ def _flash_attn_fwd(
     use_2cta_instrs = (
         arch // 10 in [10, 11]
         and not requested_disable_2cta
-        # VC's small batched mean MMA is faster without the two-CTA cluster.
-        and not (vc_expcast and vc_mean is not None)
         and not causal
         and not local
         and not is_split_kv
@@ -1216,7 +1205,7 @@ def _flash_attn_fwd(
     # Keep TC-sum eligibility separate from the large-shape scheduler choice.
     vc_dense_eligible = (
         arch == 103 and head_dim == 128 and head_dim_v == 128
-        and vc_expcast and vc_mean is None and not use_block_sparsity
+        and vc_expcast and not use_block_sparsity
         and cu_seqlens_q is None and cu_seqlens_k is None
         and seqused_q is None and seqused_k is None
         and seqlen_q == seqlen_k
@@ -1224,7 +1213,7 @@ def _flash_attn_fwd(
     vc_nonpersistent = vc_dense_eligible and seqlen_q >= 65536
     vc_tc_sum_eligible = vc_dense_eligible and seqlen_q >= 16384
     vc_vbs128_eligible = all((
-        vc_vbs128, arch == 103, vc_expcast, vc_mean is None,
+        vc_vbs128, arch == 103, vc_expcast,
         head_dim == 128, head_dim_v == 128, qhead_per_kvhead == 1,
         q_stage == 1, tile_m == 128, tile_n == 128, q_subtile_factor == 1,
         use_block_sparsity, not use_2cta_instrs, not use_clc_scheduler,
@@ -1237,7 +1226,6 @@ def _flash_attn_fwd(
         vc_expcast,
         vc_nonpersistent,
         vc_tc_sum_eligible,
-        vc_mean.dtype if vc_mean is not None else None,
         vc_vscale is not None,
         dtype,
         head_dim,
@@ -1341,13 +1329,12 @@ def _flash_attn_fwd(
                 q_descale=q_descale_tensor,
                 k_descale=k_descale_tensor,
                 v_descale=v_descale_tensor,
-                v_mean=to_cute_tensor(vc_mean, assumed_align=16),
                 v_channel_scale=to_cute_tensor(vc_vscale, assumed_align=4),
             )
             if q_descale_tensor is not None
             or k_descale_tensor is not None
             or v_descale_tensor is not None
-            or vc_mean is not None or vc_vscale is not None
+            or vc_vscale is not None
             else None
         )
 
@@ -1505,9 +1492,6 @@ def _flash_attn_fwd(
                 fa_fwd.vc_nonpersistent = vc_nonpersistent
                 fa_fwd.vc_tc_sum_eligible = vc_tc_sum_eligible
                 fa_fwd.vc_vbs128_eligible = vc_vbs128_eligible
-                fa_fwd.vc_smooth = vc_mean is not None
-                if vc_mean is not None:
-                    assert tile_n == 128, 'V means use 128-token blocks'
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
@@ -1620,9 +1604,8 @@ def _flash_attn_fwd(
                 for t in (q_call, k_call, v_call, qv_call)
             ]
         descale_tensors = (
-            DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
-                          v_mean=vc_mean, v_channel_scale=vc_vscale)
-            if q_descale is not None or k_descale is not None or v_descale is not None or vc_mean is not None or vc_vscale is not None
+            DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale, v_channel_scale=vc_vscale)
+            if q_descale is not None or k_descale is not None or v_descale is not None or vc_vscale is not None
             else None
         )
         if qv is not None:
