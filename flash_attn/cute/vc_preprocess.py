@@ -127,7 +127,7 @@ def _launch(name, grid, threads, pointers, integers, stream, wide_last=False):
 
 
 @torch.no_grad()
-def prepare(q, k, v, permutation=None, smooth=True, hadamard=True, bshd=False):
+def prepare(q, k, v, permutation=None, smooth=False, hadamard=True, bshd=False):
     """Prepare finite contiguous CUDA BHND or BSHD inputs; returns FP8 q/k/v and qs/ks/vs.
 
     Only the fused path is implemented: smooth=False, no permutation, Hadamard on. V-Smooth

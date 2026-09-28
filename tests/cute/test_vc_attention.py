@@ -56,7 +56,13 @@ def test_native_preparation():
 def test_prepare_removed_modes_raise():
     q = torch.randn(1, 2, 129, 64, device="cuda", dtype=torch.bfloat16)
     permutation = torch.arange(129, device="cuda").expand(1, 2, 129).contiguous()
-    for kwargs in ({}, {"smooth": True}, {"smooth": False, "permutation": permutation}, {"smooth": False, "hadamard": False}):
+    default, explicit = prepare(q, q, q), prepare(q, q, q, smooth=False)
+    assert set(default) == set(explicit) and all(
+        torch.equal(default[k].view(torch.uint8) if default[k].dtype == torch.float8_e4m3fn else default[k],
+                    explicit[k].view(torch.uint8) if explicit[k].dtype == torch.float8_e4m3fn else explicit[k])
+        for k in default
+    ), "the default call must equal smooth=False"
+    for kwargs in ({"smooth": True}, {"permutation": permutation}, {"hadamard": False}):
         try:
             prepare(q, q, q, **kwargs)
         except NotImplementedError:
@@ -69,7 +75,7 @@ def test_prepare_removed_modes_raise():
         pass
     else:
         raise AssertionError("b > 65535 did not raise")
-    print("PASS removed prepare() modes raise")
+    print("PASS default prepare() == smooth=False; removed modes raise")
 
 
 @torch.no_grad()
