@@ -584,12 +584,11 @@ class FlashAttentionForwardSm100:
             self.num_regs_softmax = 144
             self.num_regs_correction = 64
             self.num_regs_other = 32
-        self.vc_early_sum_o = all((self.vc_tc_sum, self.vc_tc_sum_eligible,
-                                   self.use_2cta_instrs, self.split_P_arrive == 96))
-        self.vc_early_sum_o = self.vc_early_sum_o or all((
-            self.vc_tc_sum, blocksparse_tensors is not None,
-            not self.use_2cta_instrs, self.q_stage in (1, 2), self.split_P_arrive == 96,
-        ))
+        # Two cases: 2-CTA dense (TC-sum eligible) or 1-CTA sparse (q_stage 1 or 2).
+        self.vc_early_sum_o = self.vc_tc_sum and self.split_P_arrive == 96 and (
+            (self.vc_tc_sum_eligible and self.use_2cta_instrs)
+            or (blocksparse_tensors is not None and not self.use_2cta_instrs and self.q_stage in (1, 2))
+        )
         # The next QK protects intermediate alpha; final stats still need an explicit drain.
         self.vc_sparse_stats_overlap = (self.vc_tc_sum and blocksparse_tensors is not None
                                         and not self.use_2cta_instrs and self.q_stage == 2)
