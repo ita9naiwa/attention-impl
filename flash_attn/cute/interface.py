@@ -81,6 +81,10 @@ BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler
 USE_BLOCKS_TO_BATCH: bool = True
 
 
+# Mask attributes that change the backward kernel (q-block invariance, VBS KV block size) on top of the shared mixers.
+_BWD_MASK_MIXER_ATTRS = utils._MIXER_ATTRS + ("__q_block_invariant__", "__vbs_kv_block_size__")
+
+
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
     import re
@@ -2026,7 +2030,8 @@ def _flash_attn_bwd(
     """
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
-    if _workspace is not None or _return_workspace:
+    partitioned = _workspace is not None or _return_workspace  # private two-partition workspace protocol
+    if partitioned:
         assert learnable_sink is None and not fake_mode
         assert q.numel() > 0 and k.numel() > 0
     arch = _get_device_arch()
@@ -2316,7 +2321,7 @@ def _flash_attn_bwd(
     head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
     # Private two-partition protocol: only the first call initializes dQ.
-    if _workspace is not None or _return_workspace:
+    if partitioned:
         assert arch // 10 == 10 and head_dim in (64, 128)
         assert not use_2cta_instrs and not deterministic and qhead_per_kvhead == 1
         assert cu_seqlens_q is None and cu_seqlens_k is None
@@ -2326,7 +2331,7 @@ def _flash_attn_bwd(
     workspace_context = (
         q, out, dout, lse, dlse, softmax_scale, m_block_size,
         torch.cuda.current_stream(device).cuda_stream,
-    ) if (_workspace is not None or _return_workspace) else None
+    ) if partitioned else None
     if _workspace is not None:
         dq_accum, dpsum, lse_log2, previous = _workspace
         assert all(x is y for x, y in zip(workspace_context[:5], previous[:5]))
@@ -2462,7 +2467,7 @@ def _flash_attn_bwd(
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
     mask_mod_hash = (
-        utils.hash_callable(mask_mod, mixer_attrs=utils._MIXER_ATTRS + ("__q_block_invariant__", "__vbs_kv_block_size__"))
+        utils.hash_callable(mask_mod, mixer_attrs=_BWD_MASK_MIXER_ATTRS)
         if mask_mod else False
     )
     num_aux_tensors = len(aux_tensors) if aux_tensors else 0
