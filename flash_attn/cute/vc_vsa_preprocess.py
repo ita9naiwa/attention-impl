@@ -48,9 +48,6 @@ def _library(device):
             "vsa_stats",
             "vsa_reduce",
             "vsa_quantize",
-            "vsa_routes",
-            "vsa_routes_sorted",
-            "vsa_routes_warp",
         ),
     )
 
@@ -175,61 +172,3 @@ def prepare_vsa(
             stream,
         )
     return {"q": oq, "k": ok, "v": ov, "qs": qs, "ks": ks, "vs": vs}, pools
-
-
-def prepare_vsa_routes(selected, sizes, block_size, prefix, document_start=0):
-    """Return full indices/counts and partial indices/counts from top-k IDs.
-
-    ``selected`` is int64 [B,H,Q,K], containing unique global video-parent IDs
-    in [document_start + prefix, document_start + sizes.numel()). Prefix parents
-    are implicit. ``sizes`` is int32 with values in [0, block_size]. These content
-    invariants belong to the caller; validating them here would synchronize or
-    add sorting. Invalid IDs are skipped safely, but malformed/duplicate inputs
-    have no defined attention semantics. Output lists are ascending int32, with
-    capacity (prefix+K)*(block_size//128). Partial256 parents retain both children.
-    """
-    if (
-        selected.ndim != 4
-        or selected.dtype != torch.int64
-        or not selected.is_cuda
-        or sizes.ndim != 1
-        or sizes.dtype != torch.int32
-        or sizes.device != selected.device
-    ):
-        raise ValueError(
-            "selected must be CUDA int64 B/H/Q/K; sizes must be same-device int32 vector"
-        )
-    if any(type(value) is not int for value in (block_size, prefix, document_start)):
-        raise ValueError("block_size, prefix and document_start must be integers")
-    if block_size not in (128, 256):
-        raise ValueError("block_size must be 128 or 256")
-    b, h, q, topk = selected.shape
-    parents = sizes.numel()
-    rows = b * h * q
-    capacity = (prefix + topk) * (block_size // 128)
-    if (
-        min(b, h, q, parents) < 1
-        or not 0 <= prefix <= parents
-        or topk > parents - prefix
-        or document_start < 0
-        or max(rows, capacity, parents * (block_size // 128), document_start + parents) > 2**31 - 1
-        or capacity < 1
-    ):
-        raise ValueError("invalid or empty route dimensions, prefix, or document range")
-    selected = selected.contiguous()
-    sizes = sizes.contiguous()
-    full_idx = torch.empty((b, h, q, capacity), dtype=torch.int32, device=selected.device)
-    mask_idx = torch.empty_like(full_idx)
-    full_cnt = torch.empty((b, h, q), dtype=torch.int32, device=selected.device)
-    mask_cnt = torch.empty_like(full_cnt)
-    short_route = prefix + topk <= 32 and parents <= 1073741823
-    with torch.cuda.device(selected.device):
-        _launch(
-            "vsa_routes_warp" if short_route else ("vsa_routes_sorted" if prefix + topk <= 1024 and parents <= 1073741823 else "vsa_routes"),
-            ((rows + 3) // 4 if short_route else rows, 1, 1),
-            128,
-            (selected, sizes, full_idx, full_cnt, mask_idx, mask_cnt),
-            (rows, topk, prefix, document_start, block_size, capacity, parents),
-            torch.cuda.current_stream().cuda_stream,
-        )
-    return full_idx, full_cnt, mask_idx, mask_cnt
