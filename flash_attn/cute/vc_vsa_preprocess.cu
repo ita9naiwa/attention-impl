@@ -1,5 +1,13 @@
 #include "vc_preprocess.cu"
 
+// A BF16 quartet loaded as one uint2 -> four floats (the bits of read_contiguous's aligned branch).
+__device__ __forceinline__ void unpack_bf16x4(uint2 bits, float *out) {
+    out[0]=__uint_as_float(bits.x<<16);
+    out[1]=__uint_as_float(bits.x&0xffff0000u);
+    out[2]=__uint_as_float(bits.y<<16);
+    out[3]=__uint_as_float(bits.y&0xffff0000u);
+}
+
 // Stats D128: BF16 with all three addresses 8B-aligned issues the Q/K/V uint2 loads before any unpack
 // (same bits as read_contiguous); anything else uses read_contiguous per input.
 template<int D> __device__ __forceinline__ void read_qkv_contiguous(
@@ -14,18 +22,9 @@ template<int D> __device__ __forceinline__ void read_qkv_contiguous(
                 uint2 qb=*((const uint2*)qa);
                 uint2 kb=*((const uint2*)ka);
                 uint2 vb=*((const uint2*)va);
-                rawq[0]=__uint_as_float(qb.x<<16);
-                rawq[1]=__uint_as_float(qb.x&0xffff0000u);
-                rawq[2]=__uint_as_float(qb.y<<16);
-                rawq[3]=__uint_as_float(qb.y&0xffff0000u);
-                rawk[0]=__uint_as_float(kb.x<<16);
-                rawk[1]=__uint_as_float(kb.x&0xffff0000u);
-                rawk[2]=__uint_as_float(kb.y<<16);
-                rawk[3]=__uint_as_float(kb.y&0xffff0000u);
-                rawv[0]=__uint_as_float(vb.x<<16);
-                rawv[1]=__uint_as_float(vb.x&0xffff0000u);
-                rawv[2]=__uint_as_float(vb.y<<16);
-                rawv[3]=__uint_as_float(vb.y&0xffff0000u);
+                unpack_bf16x4(qb,rawq);
+                unpack_bf16x4(kb,rawk);
+                unpack_bf16x4(vb,rawv);
                 return;
             }
         }
@@ -94,9 +93,8 @@ template<int D> __device__ void vsa_stats_impl(
         for (int row=warp; row<block_size; row+=8) {
             uint2 nq=make_uint2(0,0), nk=nq, nv=nq; bool nvalid=false;
             if (row+8<block_size) fetch(row+8,nq,nk,nv,nvalid);
-            float rawq[W]={__uint_as_float(qb.x<<16),__uint_as_float(qb.x&0xffff0000u),__uint_as_float(qb.y<<16),__uint_as_float(qb.y&0xffff0000u)};
-            float rawk[W]={__uint_as_float(kb.x<<16),__uint_as_float(kb.x&0xffff0000u),__uint_as_float(kb.y<<16),__uint_as_float(kb.y&0xffff0000u)};
-            float rawv[W]={__uint_as_float(vb.x<<16),__uint_as_float(vb.x&0xffff0000u),__uint_as_float(vb.y<<16),__uint_as_float(vb.y&0xffff0000u)};
+            float rawq[W], rawk[W], rawv[W];
+            unpack_bf16x4(qb,rawq); unpack_bf16x4(kb,rawk); unpack_bf16x4(vb,rawv);
             accumulate(rawq,rawk,rawv,query_valid);
             qb=nq; kb=nk; vb=nv; query_valid=nvalid;
         }
@@ -269,9 +267,8 @@ template<int D> __device__ void vsa_quantize_impl(
                 bool more=stride<padded_n-first;
                 uint2 nq=make_uint2(0,0),nk=nq,nv=nq; int64_t nqi=0; bool nvalid=false;
                 if(more) fetch(token+stride,nq,nk,nv,nqi,nvalid);
-                float qr[4]={__uint_as_float(qb.x<<16),__uint_as_float(qb.x&0xffff0000u),__uint_as_float(qb.y<<16),__uint_as_float(qb.y&0xffff0000u)};
-                float kr[4]={__uint_as_float(kb.x<<16),__uint_as_float(kb.x&0xffff0000u),__uint_as_float(kb.y<<16),__uint_as_float(kb.y&0xffff0000u)};
-                float vr[4]={__uint_as_float(vb.x<<16),__uint_as_float(vb.x&0xffff0000u),__uint_as_float(vb.y<<16),__uint_as_float(vb.y&0xffff0000u)};
+                float qr[4], kr[4], vr[4];
+                unpack_bf16x4(qb,qr); unpack_bf16x4(kb,kr); unpack_bf16x4(vb,vr);
                 rotate_contiguous<D,true>(qr,kr,scale);
                 #pragma unroll
                 for(int j=0;j<4;++j) {qr[j]/=qscale; kr[j]=(kr[j]-km[j])/kscale; vr[j]/=vscale[j];}
@@ -340,6 +337,13 @@ __device__ __forceinline__ int vsa_route_parent(
  return (int)(global - document_start);
 }
 
+// Route sort key: full tiles by parent id, then partial tiles (offset by parents), invalid or empty parents last.
+constexpr int ROUTE_NONE=2147483647;
+__device__ __forceinline__ int vsa_route_key(int parent, const int *sizes, int block_size, int parents) {
+ int size=parent>=0?sizes[parent]:0;
+ return size==block_size?parent:(size>0&&size<block_size?parent+parents:ROUTE_NONE);
+}
+
 extern "C" __global__ void vsa_routes(
  const int64_t *selected, const int *sizes, int *full_idx, int *full_cnt,
  int *mask_idx, int *mask_cnt, int rows, int topk, int prefix,
@@ -388,8 +392,7 @@ extern "C" __global__ void vsa_routes_sorted(
  int total=prefix+topk, n=1; while(n<total)n*=2;
  for(int i=tid;i<n;i+=blockDim.x){
   int p=i<total?vsa_route_parent(selected,row,topk,i,prefix,document_start,parents):-1;
-  int sz=p>=0?sizes[p]:0;
-  keys[i]=sz==block_size?p:(sz>0&&sz<block_size?p+parents:2147483647);
+  keys[i]=vsa_route_key(p,sizes,block_size,parents);
  }
  __syncthreads();
  for(int k=2;k<=n;k*=2)for(int j=k/2;j>0;j/=2){
@@ -397,7 +400,7 @@ extern "C" __global__ void vsa_routes_sorted(
    if(other>i){int a=keys[i],b=keys[other]; if((a>b)==((i&k)==0)){keys[i]=b;keys[other]=a;}}
   } __syncthreads();
  }
- if(tid==0){nf=0;nm=0;for(int i=0;i<total;i++){nf+=keys[i]<parents;nm+=keys[i]>=parents&&keys[i]<2147483647;}
+ if(tid==0){nf=0;nm=0;for(int i=0;i<total;i++){nf+=keys[i]<parents;nm+=keys[i]>=parents&&keys[i]<ROUTE_NONE;}
   full_cnt[row]=nf*(block_size/128);mask_cnt[row]=nm*(block_size/128);}
  __syncthreads();
  int factor=block_size/128;int64_t offset=(int64_t)row*capacity;
@@ -415,8 +418,7 @@ extern "C" __global__ void vsa_routes_warp(
  int lane=threadIdx.x%32, row=blockIdx.x*4+threadIdx.x/32;
  if (row>=rows) return;
  int parent=lane<prefix+topk?vsa_route_parent(selected,row,topk,lane,prefix,document_start,parents):-1;
- int size=parent>=0?sizes[parent]:0;
- int key=size==block_size?parent:(size>0&&size<block_size?parent+parents:2147483647);
+ int key=vsa_route_key(parent,sizes,block_size,parents);
  #pragma unroll
  for (int k=2;k<=32;k*=2) {
   #pragma unroll
@@ -427,12 +429,12 @@ extern "C" __global__ void vsa_routes_warp(
   }
  }
  int nf=__popc(__ballot_sync(0xffffffff,key<parents));
- int nm=__popc(__ballot_sync(0xffffffff,key>=parents&&key<2147483647));
+ int nm=__popc(__ballot_sync(0xffffffff,key>=parents&&key<ROUTE_NONE));
  int factor=block_size/128;int64_t offset=(int64_t)row*capacity;
  for(int i=lane;i<capacity;i+=32){full_idx[offset+i]=-1;mask_idx[offset+i]=-1;}
  __syncwarp();
  if(lane==0){full_cnt[row]=nf*factor;mask_cnt[row]=nm*factor;}
- if(key<2147483647){
+ if(key<ROUTE_NONE){
   bool full=key<parents;int rank=full?lane:lane-nf;
   int *out=full?full_idx:mask_idx;int p=full?key:key-parents;
   for(int child=0;child<factor;++child)out[offset+rank*factor+child]=p*factor+child;
