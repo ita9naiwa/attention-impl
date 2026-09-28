@@ -159,6 +159,26 @@ extern "C" __global__ void __launch_bounds__(256,4) vsa_stats(
     else vsa_stats_impl<128>(q,k,v,source_map,query_map,sizes,stats,pq,pk,pv,source_n,nblocks,h,block_size,query_n,query_offset,metadata_mask,scale);
 }
 
+// Rotate, scale and store one token (the arithmetic both vsa_quantize paths share). The scale pointers address the (b,h)
+// qs / ks and this lane's W channels of kmean / vs, in global memory or in registers.
+template<int D> __device__ __forceinline__ void vsa_quantize_store(
+    float (&qr)[D/32],float (&kr)[D/32],float (&vr)[D/32],const float *qscale,const float *kscale,const float *km,const float *vscale,
+    float scale,uint8_t *oq,uint8_t *ok,uint8_t *ov,int64_t dst,int64_t qdst,bool query_valid) {
+    constexpr int W=D/32;
+    rotate_contiguous<D,true>(qr,kr,scale);
+    #pragma unroll
+    for(int j=0;j<W;++j) {qr[j]/=*qscale; kr[j]=(kr[j]-km[j])/ *kscale; vr[j]/=vscale[j];}
+    if constexpr(D==128) {
+        if(query_valid) *(unsigned int*)(oq+qdst)=to_fp8_four(qr[0],qr[1],qr[2],qr[3]);
+        *(unsigned int*)(ok+dst)=to_fp8_four(kr[0],kr[1],kr[2],kr[3]);
+        *(unsigned int*)(ov+dst)=to_fp8_four(vr[0],vr[1],vr[2],vr[3]);
+    } else {
+        if(query_valid) *(unsigned short*)(oq+qdst)=to_fp8_two(qr[0],qr[1]);
+        *(unsigned short*)(ok+dst)=to_fp8_two(kr[0],kr[1]);
+        *(unsigned short*)(ov+dst)=to_fp8_two(vr[0],vr[1]);
+    }
+}
+
 template<int D> __device__ __forceinline__ void vsa_quantize_token(
     const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
     const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
@@ -192,22 +212,9 @@ template<int D> __device__ __forceinline__ void vsa_quantize_token(
             vr[j]=valid ? read_input(v,src+j,BF16) : 0;
         }
     }
-    rotate_contiguous<D,true>(qr,kr,scale);
-    #pragma unroll
-    for(int j=0;j<W;++j) {
-        qr[j]/=qs[bh]; kr[j]=(kr[j]-kmean[bh*D+c+j])/ks[bh]; vr[j]/=vs[bh*D+c+j];
-    }
     int64_t dst=(((int64_t)batch*padded_n+token)*h+head)*D+c;
     int64_t qdst=(((int64_t)batch*query_n+qi)*h+head)*D+c;
-    if constexpr(D==128) {
-        if(query_valid) *(unsigned int*)(oq+qdst)=to_fp8_four(qr[0],qr[1],qr[2],qr[3]);
-        *(unsigned int*)(ok+dst)=to_fp8_four(kr[0],kr[1],kr[2],kr[3]);
-        *(unsigned int*)(ov+dst)=to_fp8_four(vr[0],vr[1],vr[2],vr[3]);
-    } else {
-        if(query_valid) *(unsigned short*)(oq+qdst)=to_fp8_two(qr[0],qr[1]);
-        *(unsigned short*)(ok+dst)=to_fp8_two(kr[0],kr[1]);
-        *(unsigned short*)(ov+dst)=to_fp8_two(vr[0],vr[1]);
-    }
+    vsa_quantize_store<D>(qr,kr,vr,qs+bh,ks+bh,kmean+bh*D+c,vs+bh*D+c,scale,oq,ok,ov,dst,qdst,query_valid);
 }
 
 template<int D> __device__ void vsa_quantize_impl(
@@ -248,14 +255,9 @@ template<int D> __device__ void vsa_quantize_impl(
                 if(more) fetch(token+stride,nq,nk,nv,nqi,nvalid);
                 float qr[4], kr[4], vr[4];
                 unpack_bf16x4(qb,qr); unpack_bf16x4(kb,kr); unpack_bf16x4(vb,vr);
-                rotate_contiguous<D,true>(qr,kr,scale);
-                #pragma unroll
-                for(int j=0;j<4;++j) {qr[j]/=qscale; kr[j]=(kr[j]-km[j])/kscale; vr[j]/=vscale[j];}
                 int64_t dst=(((int64_t)batch*padded_n+token)*h+head)*D+c;
                 int64_t qdst=(((int64_t)batch*query_n+qi)*h+head)*D+c;
-                if(query_valid) *(unsigned int*)(oq+qdst)=to_fp8_four(qr[0],qr[1],qr[2],qr[3]);
-                *(unsigned int*)(ok+dst)=to_fp8_four(kr[0],kr[1],kr[2],kr[3]);
-                *(unsigned int*)(ov+dst)=to_fp8_four(vr[0],vr[1],vr[2],vr[3]);
+                vsa_quantize_store<D>(qr,kr,vr,&qscale,&kscale,km,vscale,scale,oq,ok,ov,dst,qdst,query_valid);
                 if(!more) return;
                 first+=stride; token+=stride; qb=nq; kb=nk; vb=nv; qi=nqi; query_valid=nvalid;
             }
