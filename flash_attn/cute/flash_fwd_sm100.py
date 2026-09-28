@@ -592,13 +592,12 @@ class FlashAttentionForwardSm100:
         # The next QK protects intermediate alpha; final stats still need an explicit drain.
         self.vc_sparse_stats_overlap = (self.vc_tc_sum and blocksparse_tensors is not None
                                         and not self.use_2cta_instrs and self.q_stage == 2)
-        # Opt-in. vc_sparse_stats_overlap implies vc_tc_sum (ExpCast, no causal/local/score_mod)
+        # vc_sparse_stats_overlap implies vc_tc_sum (ExpCast, no causal/local/score_mod)
         # and q_stage 2; the factor-1 checks pin sparse Q256 / physical KV128. The full-list callback is then
         # apply_mask_sm100(mask_mod=None, mask_seqlen=False, no rBitmask): a score no-op even under a dynamic
         # Q-boundary guard, so full-inner tiles may consume the ld.red row max.
-        self.vc_full_inner_hwmax = all((utils._fa_vc_full_inner_hwmax_enabled, self.vc_sparse_stats_overlap,
-                                        self.use_ldred_rowmax, self.q_subtile_factor == 1,
-                                        self.kv_subtile_factor == 1))
+        self.vc_full_inner_hwmax = all((self.vc_sparse_stats_overlap, self.use_ldred_rowmax,
+                                        self.q_subtile_factor == 1, self.kv_subtile_factor == 1))
         self.vc_compact = all((self.vc_two_pass, self.use_tma_Q, self.use_tma_KV,
                                self.use_tma_O, not self.use_clc_scheduler,
                                self.is_persistent, self.qhead_per_kvhead == 1, self.q_subtile_factor == 1,
@@ -606,7 +605,6 @@ class FlashAttentionForwardSm100:
         # KV ping-pong: one 128-row Q stage, KV tile j goes to slot j % 2 (softmax WG, S/P and O
         # TMEM buffers, stats); the correction warps merge both O slots once per tile.
         self.kv_pingpong = all((
-            utils._fa_kv_pingpong_enabled,
             self.q_stage == 1,
             blocksparse_tensors is not None,
             self.q_dtype is cutlass.BFloat16,
@@ -3478,7 +3476,7 @@ class FlashAttentionForwardSm100:
         Per slot this is the q_stage=1 protocol; tiles are visited in load order, which is the
         order the MMA and both softmax warpgroups produce them. Slot 1 is used iff the tile has
         >= 2 KV blocks; when unused its stats are never read and O1 is never loaded, and the
-        epilogue is the unchanged one-stream epilogue (bit-exact vs FA_KV_PINGPONG=0).
+        epilogue is the unchanged one-stream epilogue (bit-exact vs the one-stream kernel).
         """
         slot1_used = total_block_count > 1
         # First tile of each slot: nothing to rescale.
