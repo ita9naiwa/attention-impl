@@ -612,7 +612,8 @@ def _flash_attn_fwd(
         block_sparse_tensors: A tuple of tensors used for block sparsity.
         vc_vbs128: Use the built-in physical-KV128 valid-count mask (aux[0] values in [0,128]).
             Requires fixed-length sparse QKV and mask_mod=None; enables compact VC when supported.
-        alias_guard: Persistent-grid alias guard hint for the block-sparse Q256 1-CTA static persistent forward.
+        alias_guard: Persistent-grid alias guard hint for the block-sparse Q256, or single-stage Q128, 1-CTA static
+            persistent forward.
             True turns it on (for launches whose dense prefix rows pile onto the same CTAs); None/False keep the
             SM-count grid. Bit-exact either way.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
@@ -826,6 +827,8 @@ def _flash_attn_fwd(
     if is_fp8:
         assert arch // 10 == 10, "FP8 is only supported on SM100 (compute capability 10.x) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
+    # The kernel engages the guard only for `alias_guard_hint is True` on block-sparse launches; key on that.
+    alias_guard_on = alias_guard is True and use_block_sparsity
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
@@ -1221,7 +1224,7 @@ def _flash_attn_fwd(
         not causal, not local, score_mod is None, learnable_sink is None,
     ))
     compile_key = (
-        alias_guard,
+        alias_guard_on,
         vc_vbs128_eligible,
         vc_expcast,
         vc_nonpersistent,
@@ -1484,7 +1487,7 @@ def _flash_attn_fwd(
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
                 fa_fwd.vc_expcast = vc_expcast
-                fa_fwd.alias_guard_hint = alias_guard
+                fa_fwd.alias_guard_hint = alias_guard_on
                 if vc_expcast and use_block_sparsity and fa_fwd.is_sm103 and score_mod is None:
                     # Full sparse iterations use hardware max; masked iterations
                     # retain the post-mask software reduction in softmax_step.
