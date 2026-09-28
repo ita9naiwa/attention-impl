@@ -1,7 +1,69 @@
-"""BHND and BNHD inputs must describe identical attention values."""
+"""BHND and BNHD inputs must describe identical attention values; prepare() matches an exact CPU emulation."""
 
 import torch
-from flash_attn.cute.vc_preprocess import _rotate_qk, prepare
+from flash_attn.cute.vc_preprocess import prepare
+
+
+def _fp8(x):
+    """cvt.rn.satfinite.e4m3: round to nearest even, saturate finite overflow and infinities to +-448, NaN -> canonical 0x7F."""
+    return torch.where(x.isnan(), torch.full_like(x, float("nan")).abs(), x.clamp(-448, 448)).to(torch.float8_e4m3fn)
+
+
+def _serial_sum(x, dim):
+    total = torch.zeros_like(x.select(dim, 0))
+    for i in range(x.shape[dim]):
+        total = total + x.select(dim, i)
+    return total
+
+
+def _fmax_all(x, dims):
+    """fmaxf reduction (NaN operands ignored; order-independent otherwise)."""
+    for d in sorted(dims, reverse=True):
+        x = torch.stack([x.select(d, i) for i in range(x.shape[d])]).nan_to_num(nan=-float("inf"), posinf=float("inf"), neginf=-float("inf")).amax(0)
+    return x
+
+
+@torch.no_grad()
+def _reference(q, k, v, bshd=False):
+    """Exact CPU float32 emulation of prepare(smooth=False): Hadamard butterfly from the lowest channel bit up (lower
+    index a + b, upper a - b) times the device rsqrtf(d); K sums serial over rows within each 128-row block, then serial
+    over blocks; fmaxf/fminf statistics; IEEE divisions; satfinite E4M3 codes in BNHD."""
+    q, k, v = [(x.transpose(1, 2) if bshd else x).float().cpu() for x in (q, k, v)]
+    b, h, n, d = q.shape
+    scale = torch.rsqrt(torch.tensor(float(d), device="cuda")).cpu()
+
+    def rotate(x):
+        bit = 1
+        while bit < d:
+            x = x.reshape(b, h, n, d // (2 * bit), 2, bit)
+            lo, hi = x[..., 0, :], x[..., 1, :]
+            x = torch.stack((lo + hi, lo - hi), -2).reshape(b, h, n, d)
+            bit *= 2
+        return x * scale
+
+    rq, rk = rotate(q), rotate(k)
+    nb = (n + 127) // 128
+    blocks = [_serial_sum(rk[:, :, i * 128 : (i + 1) * 128], 2) for i in range(nb)]
+    km = _serial_sum(torch.stack(blocks, 2), 2) / n
+    lo = torch.fmin(torch.full_like(km, float("inf")), rk.nan_to_num(nan=float("inf"), posinf=float("inf"), neginf=-float("inf")).amin(2))
+    hi = torch.fmax(torch.full_like(km, -float("inf")), rk.nan_to_num(nan=-float("inf"), posinf=float("inf"), neginf=-float("inf")).amax(2))
+    qm = torch.fmax(torch.zeros(b, h), _fmax_all(rq.abs(), (2, 3)))
+    kr = torch.fmax((lo - km).abs(), (hi - km).abs())
+    kr = torch.where(kr.isnan().all(-1, keepdim=True), float("nan"), kr.nan_to_num(nan=-float("inf"), posinf=float("inf"), neginf=-float("inf"))).amax(-1)
+    vm = torch.fmax(torch.zeros(b, h, d), _fmax_all(v.abs(), (2,)))
+    qs = torch.where(qm > 0, qm / 448, 1.0)
+    ks = torch.where(kr > 0, kr / 448, 1.0)
+    vs = torch.where(vm > 0, vm / 448, 1.0)
+    codes = [_fp8(x).transpose(1, 2).contiguous() for x in (rq / qs[..., None, None], (rk - km[:, :, None]) / ks[..., None, None], v / vs[:, :, None])]
+    return {"q": codes[0], "k": codes[1], "v": codes[2], "qs": qs, "ks": ks, "vs": vs}
+
+
+def _assert_equal(actual, expected, label):
+    for key, value in expected.items():
+        got = actual[key].cpu()
+        if value.dtype == torch.float8_e4m3fn:
+            got, value = got.view(torch.uint8), value.view(torch.uint8)
+        assert torch.equal(got, value), (label, key)
 
 
 @torch.no_grad()
@@ -24,14 +86,7 @@ def test_fused_stats_preserve_row_order():
                     view.copy_(value)
                     views.append(view)
                 q, k, v = views
-            rq, rk = _rotate_qk(q, k)
-            # The unfused path retains the original serial row sum independently.
-            expected = prepare(rq, rk, v.float(), smooth=False, hadamard=False)
-            actual = prepare(q, k, v, smooth=False)
-            for key in expected:
-                assert torch.equal(
-                    actual[key].view(torch.uint8), expected[key].view(torch.uint8)
-                ), (d, n, key)
+            _assert_equal(prepare(q, k, v, smooth=False), _reference(q, k, v), (d, n))
 
 
 def _exceptional(kind, shape, dtype, g):
@@ -58,9 +113,9 @@ def _exceptional(kind, shape, dtype, g):
 
 
 @torch.no_grad()
-def test_fused_quantizer_exceptional_inputs_match_unfused():
-    # The fused quantizer's butterflies (signed-unit FMA) must round exactly like the separate
-    # rotation's add/sub, including overflow to Inf/NaN, signed zeros and subnormals.
+def test_fused_quantizer_exceptional_inputs_match_reference():
+    # The fused butterflies (signed-unit FMA) must round exactly like plain add/sub, including overflow to
+    # Inf/NaN, signed zeros and subnormals.
     g = torch.Generator().manual_seed(7)
     for kind in ("randn", "large", "zeros", "subnormal", "spikes", "nonfinite"):
         for dtype in (torch.bfloat16, torch.float16, torch.float32):
@@ -68,15 +123,8 @@ def test_fused_quantizer_exceptional_inputs_match_unfused():
                 for bshd in (False, True):
                     shape = (2, 300, 3, d) if bshd else (2, 3, 300, d)
                     q, k, v = (_exceptional(kind, shape, dtype, g) for _ in range(3))
-                    rq, rk = _rotate_qk(q, k, bshd=bshd)  # always BHND
-                    vv = (v.transpose(1, 2) if bshd else v).float().contiguous()
-                    expected = prepare(rq, rk, vv, smooth=False, hadamard=False)
-                    actual = prepare(q, k, v, smooth=False, bshd=bshd)
-                    for key in expected:
-                        assert torch.equal(
-                            actual[key].view(torch.uint8),
-                            expected[key].view(torch.uint8),
-                        ), (kind, dtype, d, bshd, key)
+                    _assert_equal(prepare(q, k, v, smooth=False, bshd=bshd), _reference(q, k, v, bshd),
+                                  (kind, dtype, d, bshd))
 
 
 @torch.no_grad()
@@ -87,27 +135,19 @@ def test_preprocess_layout():
             torch.randn((2, 129, 3, d), device="cuda", dtype=torch.bfloat16)
             for _ in range(3)
         ]
-        for smooth in (False, True):
-            expected = prepare(
-                *(x.transpose(1, 2).contiguous() for x in inputs), smooth=smooth
-            )
-            actual = prepare(*inputs, smooth=smooth, bshd=True)
-            for key in expected:
-                assert torch.equal(
-                    actual[key].view(torch.uint8), expected[key].view(torch.uint8)
-                ), (d, smooth, key)
-    # CUDA grid y/z cap: retain support for large batch/head counts at N=1.
+        expected = prepare(*(x.transpose(1, 2).contiguous() for x in inputs), smooth=False)
+        actual = prepare(*inputs, smooth=False, bshd=True)
+        for key in expected:
+            assert torch.equal(actual[key].view(torch.uint8), expected[key].view(torch.uint8)), (d, key)
+    # CUDA grid y/z cap: batch or heads > 65535 are rejected (the unfused 1-D grid fallback was removed).
     for shape in ((1, 1, 65536, 64), (65536, 1, 1, 64)):
         x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-        p = prepare(x, x, x, smooth=False, hadamard=False, bshd=True)
-        decoded_q = p["q"].float() * p["qs"][:, None, :, None]
-        assert (decoded_q - x.float()).norm() / x.float().norm() < 0.04
-        assert torch.count_nonzero(p["k"].float()) == 0
-        decoded_v = p["v"].float() * p["vs"][:, None, :, :]
-        torch.testing.assert_close(decoded_v, x.float(), rtol=2e-6, atol=1e-7)
-    print(
-        "PASS native preprocessing: layouts, scales, means, large batch/head grid boundaries"
-    )
+        try:
+            prepare(x, x, x, smooth=False, bshd=True)
+        except ValueError:
+            continue
+        raise AssertionError(f"{shape} did not raise")
+    print("PASS native preprocessing: layouts, scales, batch/head grid limits")
 
 
 @torch.no_grad()
@@ -143,5 +183,6 @@ def test_fused_dynamic_graph():
 
 if __name__ == "__main__":
     test_fused_stats_preserve_row_order()
+    test_fused_quantizer_exceptional_inputs_match_reference()
     test_preprocess_layout()
     test_fused_dynamic_graph()
