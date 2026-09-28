@@ -281,15 +281,17 @@ def _vbs_vector_mask():
 
 @torch.no_grad()
 def test_full_inner_hwmax_exact():
-    """FA_VC_FULL_INNER_HWMAX (default on) must reproduce the software-row-max VC Q256 sparse kernel (=0) bit for bit."""
+    """VC Q256 sparse full-list inner tiles take the ld.red row max (vc_full_inner_hwmax); the mask list keeps the
+    software row max. Moving every full block into the mask list (size-128 mask, same visit order) runs the same
+    compiled kernel on the software path, so out/LSE must match it bit for bit."""
     if torch.cuda.get_device_capability() != (10, 3):
         print("SKIP full-inner hwmax: requires SM103")
         return
-    from flash_attn.cute import interface, utils
+    from flash_attn.cute import interface
     from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 
     records = []
-    original_kernel, original_flag = interface.FlashAttentionForwardSm100, utils._fa_vc_full_inner_hwmax_enabled
+    original_kernel = interface.FlashAttentionForwardSm100
 
     class Traced(original_kernel):
         def __init__(self, *args, **kwargs):
@@ -302,18 +304,19 @@ def test_full_inner_hwmax_exact():
     heads, nk = 2, 10
     torch.manual_seed(7)
 
-    def lists(sizes, sq, pattern):
+    def lists(sizes, sq, pattern, fold=False):
         # pattern[h][m] -> selected physical KV blocks; classify by size like the VC wrapper.
+        # fold: mask list = full + mask, so the reversed visit order (mask list, then full list) is unchanged.
         mb = (sq + 255) // 256
         idx = {n: torch.zeros(1, heads, mb, nk, dtype=torch.int32) for n in ("full", "mask")}
         cnt = {n: torch.zeros(1, heads, mb, dtype=torch.int32) for n in ("full", "mask")}
         for h in range(heads):
             for m in range(mb):
-                for b in sorted(pattern[h][m]):
-                    kind = "full" if sizes[b] == 128 else "mask" if sizes[b] > 0 else None
-                    if kind:
-                        idx[kind][0, h, m, cnt[kind][0, h, m]] = b
-                        cnt[kind][0, h, m] += 1
+                full = [b for b in sorted(pattern[h][m]) if sizes[b] == 128]
+                masked = [b for b in sorted(pattern[h][m]) if 0 < sizes[b] < 128]
+                for kind, blocks in (("mask", full + masked), ("full", [])) if fold else (("mask", masked), ("full", full)):
+                    cnt[kind][0, h, m] = len(blocks)
+                    idx[kind][0, h, m, : len(blocks)] = torch.tensor(blocks, dtype=torch.int32)
         return [t.cuda() for t in (cnt["mask"], idx["mask"], cnt["full"], idx["full"])]
 
     def payload(kind, sq, sk):
@@ -352,29 +355,25 @@ def test_full_inner_hwmax_exact():
             mc, mi, fc, fi = lists(sizes, sq, patterns[pat])
             sparse = BlockSparseTensorsTorch(mc, mi, fc, fi, block_size=(256, 128))
 
-            def run():
+            def run(sparse=sparse):
                 return interface._flash_attn_fwd(
                     q, k, v, q_descale=qs, k_descale=ks, vc_vscale=vs, vc_expcast=True,
                     tile_mn=(128, 128), max_seqlen_q=sq, mask_mod=mask,
                     block_sparse_tensors=sparse, aux_tensors=[aux], return_lse=True,
                 )[:2]
 
-            results = []
-            for flag in (False, True):
-                utils._fa_vc_full_inner_hwmax_enabled = flag
-                before = len(records)
-                results.append([t.clone() for t in run()])
-                if len(records) > before:  # freshly compiled kernel object
-                    assert records[-1].vc_sparse_stats_overlap and records[-1].vc_full_inner_hwmax == flag
-            (out0, lse0), (out1, lse1) = results
+            def software(sizes, pat, sq=sq):  # same kernel, every tile on the mask list (software row max)
+                return run(BlockSparseTensorsTorch(*lists(sizes, sq, patterns[pat], fold=True), block_size=(256, 128)))
+
+            out1, lse1 = [t.clone() for t in run()]
+            out0, lse0 = software(sizes, pat)
             assert torch.equal(out0, out1) and torch.equal(lse0, lse1), (kind, sq, sk, sizes)
             assert torch.isfinite(out1.float()).all()
             empty = (mc + fc)[0, :, :].repeat_interleave(256, -1)[:, :sq] == 0  # (H, Sq)
             assert torch.count_nonzero(out1[0].transpose(0, 1)[empty]) == 0
             print("full-inner hwmax exact", kind, sq, sk, flush=True)
-        assert {r.vc_full_inner_hwmax for r in records} == {False, True}, len(records)
-        # Changed auxiliary sizes, lists and V under CUDA Graph replay of the opted-in kernel.
-        utils._fa_vc_full_inner_hwmax_enabled = True
+        assert records and all(r.vc_sparse_stats_overlap and r.vc_full_inner_hwmax for r in records), len(records)
+        # Changed auxiliary sizes, lists and V under CUDA Graph replay: replay == eager.
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
@@ -391,34 +390,27 @@ def test_full_inner_hwmax_exact():
             for t in captured:
                 t.fill_(float("nan"))
             graph.replay()
-            utils._fa_vc_full_inner_hwmax_enabled = False
             ref = run()
-            utils._fa_vc_full_inner_hwmax_enabled = True
             assert all(torch.equal(a, b) for a, b in zip(captured, ref)), sizes2
-        # NaN-poisoned K payload (E4M3FN has no inf encoding): unsupported input, but the opt-in must
-        # match the software path bit for bit (NaN positions included) so behavior equals baseline.
-        sizes = [128] * 10
+        # NaN-poisoned K payload (E4M3FN has no inf encoding): unsupported input, but the hardware max must
+        # match the software path bit for bit (NaN positions included).
+        sizes, pat = [128] * 10, "a"
         aux.copy_(torch.tensor(sizes, device="cuda", dtype=torch.int32))
-        for dst, src in zip((mc, mi, fc, fi), lists(sizes, sq, patterns["a"])):
+        for dst, src in zip((mc, mi, fc, fi), lists(sizes, sq, patterns[pat])):
             dst.copy_(src)
         q, k, v = payload("random", sq, sk)
-        results_clean = [t.clone() for t in run()]
         k.view(torch.uint8)[0, 300, 0, 5] = 0x7F  # inner full tile of head 0
         k.view(torch.uint8)[0, 1000:1003, 1, :] = 0xFF  # whole rows, head 1
-        results = []
-        for flag in (False, True):
-            utils._fa_vc_full_inner_hwmax_enabled = flag
-            results.append([t.clone() for t in run()])
-        (out0, lse0), (out1, lse1) = results
-        print("NaN poison: baseline out NaNs", out0.float().isnan().sum().item(), "LSE NaNs", lse0.isnan().sum().item(),
-              "changed vs clean", not torch.equal(out0, results_clean[0]), flush=True)
+        out1, lse1 = [t.clone() for t in run()]
+        out0, lse0 = software(sizes, pat)
+        print("NaN poison: out NaNs", out0.float().isnan().sum().item(), "LSE NaNs", lse0.isnan().sum().item(), flush=True)
         for a, b in ((out0.float(), out1.float()), (lse0, lse1)):
             assert torch.equal(a.isnan(), b.isnan()) and torch.equal(a.nan_to_num(), b.nan_to_num())
-        print("PASS full-inner hwmax: exact out/LSE across full/masked/empty, Q/K edges, graph replay, NaN poison", flush=True)
+        print("PASS full-inner hwmax: exact vs software row max across full/masked/empty, Q/K edges; graph replay;"
+              " NaN poison", flush=True)
     finally:
         interface.FlashAttentionForwardSm100 = original_kernel
         interface._flash_attn_fwd.compile_cache = original_cache
-        utils._fa_vc_full_inner_hwmax_enabled = original_flag
 
 
 def test_alias_guard_hint_exact():

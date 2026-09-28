@@ -1,19 +1,17 @@
-"""FA_KV_PINGPONG: Q128 block-sparse SM100 forward with KV tiles alternating between two slots.
+"""KV ping-pong: Q128 block-sparse BF16 SM100 forward with KV tiles alternating between two slots.
 
-Mode on is compared with FA_KV_PINGPONG=0 (the one-stream kernel) in the same process. Q tiles
-with <= 1 KV block must be bit-exact (slot 1 unused, never read); longer lists may differ only by
-the two-stream merge rounding (tolerances: candidates/vsa-q128-fwd-kv-pingpong/notes/
-explorer-4-test-matrix.md, E3/E4). CUDA Graph replay must equal eager (E2).
+Checked against an FP32 reference (O, LSE, fully masked rows). A Q tile with one KV block must not
+read slot-1 residue: bit-exact vs the same tiles in a run without the residue. CUDA Graph replay
+must equal eager. The one-stream kernel is still traced for configs outside kv_pingpong (dense Q128).
 """
 
 import math
 import random
-from unittest import mock
 
 import pytest
 import torch
 
-from flash_attn.cute import flash_fwd_sm100, interface, utils
+from flash_attn.cute import flash_fwd_sm100, interface
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 from mask_mod_definitions import cute_ima_mask
 
@@ -95,7 +93,7 @@ def _inputs(tiles, heads, seed=0):
     return q, k, v
 
 
-def _fwd(q, k, v, lists, masked, enabled, aux=None):
+def _fwd(q, k, v, lists, masked, aux=None):
     mask_cnt, mask_idx, full_cnt, full_idx = lists
     sparse = BlockSparseTensorsTorch(
         mask_block_cnt=mask_cnt,
@@ -104,20 +102,19 @@ def _fwd(q, k, v, lists, masked, enabled, aux=None):
         full_block_idx=full_idx,
         block_size=(TILE, TILE),
     )
-    with mock.patch.object(utils, "_fa_kv_pingpong_enabled", enabled):
-        out, lse = interface._flash_attn_fwd(
-            q,
-            k,
-            v,
-            max_seqlen_q=_OneQStage(q.shape[1]),
-            softmax_scale=SCALE,
-            tile_mn=(TILE, TILE),
-            pack_gqa=False,
-            mask_mod=cute_ima_mask if masked else None,
-            aux_tensors=(aux or _aux(q.device)) if masked else None,
-            block_sparse_tensors=sparse,
-            return_lse=True,
-        )[:2]
+    out, lse = interface._flash_attn_fwd(
+        q,
+        k,
+        v,
+        max_seqlen_q=_OneQStage(q.shape[1]),
+        softmax_scale=SCALE,
+        tile_mn=(TILE, TILE),
+        pack_gqa=False,
+        mask_mod=cute_ima_mask if masked else None,
+        aux_tensors=(aux or _aux(q.device)) if masked else None,
+        block_sparse_tensors=sparse,
+        return_lse=True,
+    )[:2]
     return out, lse
 
 
@@ -137,60 +134,24 @@ def _reference(q, k, v, spec, masked):
     return torch.einsum("bhqk,bkhd->bqhd", p, v.float()), lse
 
 
-def _compare(spec, on, off, ref):
-    """count <= 1 tiles bit-exact (E3). Longer lists (E4): the merge only reorders FP32 sums, so
-    O may move by bf16 output rounding (observed <= 3 ulps; checked at 4), must be no less accurate than
-    the one-stream kernel against the fp32 reference, and LSE matches to 1e-4. (The planned
-    avg|dO| < 1e-4 is below the one-stream kernel's own bf16 noise: debug/d2.log.)"""
-    (out_on, lse_on), (out_off, lse_off) = on, off
-    assert torch.isfinite(out_on).all() and not torch.isnan(lse_on).any()
-    multi = []
-    for m, (mask_blocks, full_blocks) in enumerate(spec):
-        rows = slice(m * TILE, (m + 1) * TILE)
-        if len(mask_blocks) + len(full_blocks) <= 1:
-            assert torch.equal(out_on[:, rows], out_off[:, rows]), f"Q tile {m}: O not bit-exact"
-            assert torch.equal(lse_on[..., rows], lse_off[..., rows]), f"Q tile {m}: LSE not bit-exact"
-        else:
-            multi.append(m)
-    if not multi:
-        return
-    rows = torch.cat([torch.arange(m * TILE, (m + 1) * TILE) for m in multi]).cuda()
-    o_on, o_off = out_on[:, rows].float(), out_off[:, rows].float()
-    l_on, l_off = lse_on[..., rows], lse_off[..., rows]
-    # 4 bf16 ulps of the element, floored at 4 ulps of the mean |O| (near-zero outputs come from
-    # cancellation, so their rounding error scales with the accumulated terms, not with |O|).
-    eps4 = 4 * torch.finfo(torch.bfloat16).eps
-    tol = eps4 * torch.maximum(torch.maximum(o_on.abs(), o_off.abs()), o_off.abs().mean())
-    assert ((o_on - o_off).abs() <= tol).all(), ((o_on - o_off).abs() - tol).max()
-    o_ref = ref[:, rows]
-    err_on, err_off = (o_on - o_ref).abs(), (o_off - o_ref).abs()
-    assert err_on.mean() <= 1.1 * err_off.mean() + 1e-7, (err_on.mean(), err_off.mean())
-    assert torch.equal(torch.isinf(l_on), torch.isinf(l_off))
-    finite = torch.isfinite(l_off)
-    if finite.any():
-        assert (l_on[finite] - l_off[finite]).abs().max() < 1e-4
-
-
 @pytest.mark.parametrize("masked", [True, False])
 @pytest.mark.parametrize("case", [*CASES, "random0", "random1", "random2"])
-def test_kv_pingpong_matches_one_stream(case, masked):
+def test_kv_pingpong_matches_reference(case, masked):
     spec = CASES[case] if case in CASES else _random_spec(int(case[-1]))
     heads = 2
     q, k, v = _inputs(len(spec), heads)
-    lists = _lists(spec, heads)
-    on = _fwd(q, k, v, lists, masked, True)
-    off = _fwd(q, k, v, lists, masked, False)
+    out, lse = _fwd(q, k, v, _lists(spec, heads), masked)
     out_ref, lse_ref = _reference(q, k, v, spec, masked)
-    _compare(spec, on, off, out_ref)
-    assert (on[0].float() - out_ref).abs().max() < 2e-2
-    assert torch.equal(torch.isinf(on[1]), torch.isinf(lse_ref))
+    assert torch.isfinite(out).all() and not torch.isnan(lse).any()
+    assert (out.float() - out_ref).abs().max() < 2e-2
+    assert torch.equal(torch.isinf(lse), torch.isinf(lse_ref))
     finite = torch.isfinite(lse_ref)
-    assert (on[1][finite] - lse_ref[finite]).abs().max() < 1e-3
+    assert (lse[finite] - lse_ref[finite]).abs().max() < 1e-3
 
 
 def test_unused_slot_ignores_nonfinite_residue():
     """A persistent CTA first overflows O1 (slot-1 V block at bf16 max), then runs a 1-block
-    Q tile: that tile must not read O1 and stays bit-exact vs mode off."""
+    Q tile: that tile must not read O1, so it is bit-exact vs a run with no overflowing tiles."""
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     tiles = 4 * sms
     rng = random.Random(7)
@@ -199,16 +160,18 @@ def test_unused_slot_ignores_nonfinite_residue():
     spec = [([], [0, 1]) if overflow else ([], [2]) for overflow in kinds]
     q, k, v = _inputs(tiles, 1, seed=1)
     v[:, :TILE] = torch.finfo(torch.bfloat16).max
-    lists = _lists(spec, 1)
-    out_on, lse_on = _fwd(q, k, v, lists, False, True)
-    out_off, lse_off = _fwd(q, k, v, lists, False, False)
+    out, lse = _fwd(q, k, v, _lists(spec, 1), False)
+    clean = [([], [2])] * tiles
+    out_clean, lse_clean = _fwd(q, k, v, _lists(clean, 1), False)
+    out_ref = _reference(q, k, v, clean, False)[0]
     for m, overflow in enumerate(kinds):
         if overflow:
             continue
         rows = slice(m * TILE, (m + 1) * TILE)
-        assert torch.isfinite(out_on[:, rows]).all() and torch.isfinite(lse_on[..., rows]).all()
-        assert torch.equal(out_on[:, rows], out_off[:, rows]), f"Q tile {m}"
-        assert torch.equal(lse_on[..., rows], lse_off[..., rows]), f"Q tile {m}"
+        assert torch.isfinite(out[:, rows]).all() and torch.isfinite(lse[..., rows]).all()
+        assert torch.equal(out[:, rows], out_clean[:, rows]), f"Q tile {m}"
+        assert torch.equal(lse[..., rows], lse_clean[..., rows]), f"Q tile {m}"
+        assert (out[:, rows].float() - out_ref[:, rows]).abs().max() < 2e-2
 
 
 def test_graph_replay_matches_eager():
@@ -217,7 +180,7 @@ def test_graph_replay_matches_eager():
     q, k, v = _inputs(3, heads)
     lists = _lists(specs[0], heads)
     aux = _aux(q.device)  # built outside capture (host->device copy)
-    run = lambda: _fwd(q, k, v, lists, True, True, aux)  # noqa: E731
+    run = lambda: _fwd(q, k, v, lists, True, aux)  # noqa: E731
     run()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -236,8 +199,8 @@ def test_graph_replay_matches_eager():
         assert torch.equal(out_g, out_e) and torch.equal(lse_g, lse_e)
 
 
-def test_mode_flag_reaches_kernel(monkeypatch):
-    """FA_KV_PINGPONG is part of the compile key; off (and dense Q128) traces the old kernel."""
+def test_kernel_selects_kv_pingpong(monkeypatch):
+    """Sparse Q128 BF16 traces the ping-pong kernel; dense Q128 traces the one-stream kernel."""
     seen = []
     original_init = flash_fwd_sm100.FlashAttentionForwardSm100.__init__
 
@@ -248,10 +211,8 @@ def test_mode_flag_reaches_kernel(monkeypatch):
     monkeypatch.setattr(interface._flash_attn_fwd, "compile_cache", {})
     q, k, v = _inputs(2, 2)
     lists = _lists(CASES["count2"], 2)
-    with mock.patch.object(flash_fwd_sm100.FlashAttentionForwardSm100, "__init__", spy):
-        _fwd(q, k, v, lists, False, True)
-        _fwd(q, k, v, lists, False, False)
-        with mock.patch.object(utils, "_fa_kv_pingpong_enabled", True):
-            interface._flash_attn_fwd(q[:, :TILE], k, v, softmax_scale=SCALE, return_lse=True)
-    assert [kernel.kv_pingpong for kernel in seen] == [True, False, False]
-    assert [kernel.q_stage for kernel in seen] == [1, 1, 1]
+    monkeypatch.setattr(flash_fwd_sm100.FlashAttentionForwardSm100, "__init__", spy)
+    _fwd(q, k, v, lists, False)
+    interface._flash_attn_fwd(q[:, :TILE], k, v, softmax_scale=SCALE, return_lse=True)
+    assert [kernel.kv_pingpong for kernel in seen] == [True, False]
+    assert [kernel.q_stage for kernel in seen] == [1, 1]
