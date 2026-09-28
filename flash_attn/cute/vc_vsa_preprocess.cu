@@ -8,31 +8,8 @@ __device__ __forceinline__ void unpack_bf16x4(uint2 bits, float *out) {
     out[3]=__uint_as_float(bits.y&0xffff0000u);
 }
 
-// Stats D128: BF16 with all three addresses 8B-aligned issues the Q/K/V uint2 loads before any unpack
-// (same bits as read_contiguous); anything else uses read_contiguous per input.
-template<int D> __device__ __forceinline__ void read_qkv_contiguous(
-    const void *q, const void *k, const void *v, int64_t i, int dtype,
-    float *rawq, float *rawk, float *rawv) {
-    if constexpr(D==128) {
-        if(dtype==0) {
-            const unsigned short *qa=((const unsigned short*)q)+i;
-            const unsigned short *ka=((const unsigned short*)k)+i;
-            const unsigned short *va=((const unsigned short*)v)+i;
-            if(((((unsigned long long)qa)|((unsigned long long)ka)|((unsigned long long)va))&7)==0) {
-                uint2 qb=*((const uint2*)qa);
-                uint2 kb=*((const uint2*)ka);
-                uint2 vb=*((const uint2*)va);
-                unpack_bf16x4(qb,rawq);
-                unpack_bf16x4(kb,rawk);
-                unpack_bf16x4(vb,rawv);
-                return;
-            }
-        }
-    }
-    read_contiguous<D>(q,i,dtype,rawq);
-    read_contiguous<D>(k,i,dtype,rawk);
-    read_contiguous<D>(v,i,dtype,rawv);
-}
+// prepare_vsa accepts BF16 only; this is the BF16 code of the shared read_input / read_contiguous (vc_preprocess.cu).
+constexpr int BF16=0;
 
 __device__ int64_t vsa_index(const void *p, int i, bool wide) {
     return wide ? ((const int64_t*)p)[i] : ((const int*)p)[i];
@@ -42,7 +19,7 @@ template<int D> __device__ void vsa_stats_impl(
     const void *q, const void *k, const void *v, const void *source_map,
     const void *query_map, const void *sizes, float *stats,
     float *pq, float *pk, float *pv, int source_n, int nblocks, int h,
-    int block_size, int query_n, int query_offset, int dtype, int metadata_mask, float scale) {
+    int block_size, int query_n, int query_offset, int metadata_mask, float scale) {
     constexpr int W = D/32;
     int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     int block = blockIdx.x, head = blockIdx.y, batch = blockIdx.z, bh = batch*h+head;
@@ -73,7 +50,7 @@ template<int D> __device__ void vsa_stats_impl(
     };
     bool prefetch = false;
     if constexpr(D==128) {
-    prefetch = dtype==0 && ((((unsigned long long)q)|((unsigned long long)k)|((unsigned long long)v))&7)==0;
+    prefetch = ((((unsigned long long)q)|((unsigned long long)k)|((unsigned long long)v))&7)==0;
     if (prefetch) {
         // BF16 D128, 8B-aligned (every lane offset is a multiple of 4 elements): load row+8 while rotating row.
         auto fetch=[&](int row, uint2 &qb, uint2 &kb, uint2 &vb, bool &query_valid) {
@@ -109,7 +86,9 @@ template<int D> __device__ void vsa_stats_impl(
         if constexpr(D==128){
             float rawq[W], rawk[W], rawv[W];
             if(valid){
-                read_qkv_contiguous<D>(q,k,v,base+lane*W,dtype,rawq,rawk,rawv);
+                read_contiguous<D>(q,base+lane*W,BF16,rawq);
+                read_contiguous<D>(k,base+lane*W,BF16,rawk);
+                read_contiguous<D>(v,base+lane*W,BF16,rawv);
             }else{
                 #pragma unroll
                 for(int j=0;j<W;++j){rawq[j]=0;rawk[j]=0;rawv[j]=0;}
@@ -121,9 +100,9 @@ template<int D> __device__ void vsa_stats_impl(
             #pragma unroll
             for (int j=0; j<W; ++j) {
                 int c = lane*W+j;
-                float qv = valid ? read_input(q,base+c,dtype) : 0;
-                float kv = valid ? read_input(k,base+c,dtype) : 0;
-                float vv = valid ? read_input(v,base+c,dtype) : 0;
+                float qv = valid ? read_input(q,base+c,BF16) : 0;
+                float kv = valid ? read_input(k,base+c,BF16) : 0;
+                float vv = valid ? read_input(v,base+c,BF16) : 0;
                 a[5][j] += qv; a[6][j] += kv; a[7][j] += vv;
                 a[4][j] = fmaxf(a[4][j], fabsf(vv));
                 qr[j] = query_valid ? qv : 0; kr[j] = kv;
@@ -174,16 +153,16 @@ template<int D> __device__ void vsa_stats_impl(
 extern "C" __global__ void __launch_bounds__(256,4) vsa_stats(
     const void *q,const void *k,const void *v,const void *source_map,
     const void *query_map,const void *sizes,float *stats,float *pq,float *pk,float *pv,
-    int source_n,int nblocks,int h,int d,int block_size,int query_n,int query_offset,int dtype,int metadata_mask) {
+    int source_n,int nblocks,int h,int d,int block_size,int query_n,int query_offset,int metadata_mask) {
     float scale=rsqrtf((float)d);
-    if(d==64) vsa_stats_impl<64>(q,k,v,source_map,query_map,sizes,stats,pq,pk,pv,source_n,nblocks,h,block_size,query_n,query_offset,dtype,metadata_mask,scale);
-    else vsa_stats_impl<128>(q,k,v,source_map,query_map,sizes,stats,pq,pk,pv,source_n,nblocks,h,block_size,query_n,query_offset,dtype,metadata_mask,scale);
+    if(d==64) vsa_stats_impl<64>(q,k,v,source_map,query_map,sizes,stats,pq,pk,pv,source_n,nblocks,h,block_size,query_n,query_offset,metadata_mask,scale);
+    else vsa_stats_impl<128>(q,k,v,source_map,query_map,sizes,stats,pq,pk,pv,source_n,nblocks,h,block_size,query_n,query_offset,metadata_mask,scale);
 }
 
 template<int D> __device__ __forceinline__ void vsa_quantize_token(
     const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
     const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
-    int source_n,int padded_n,int query_n,int query_offset,int h,int dtype,int metadata_mask,float scale,int token) {
+    int source_n,int padded_n,int query_n,int query_offset,int h,int metadata_mask,float scale,int token) {
     constexpr int W=D/32;
     int lane=threadIdx.x%32;
     int head=blockIdx.y,batch=blockIdx.z,bh=batch*h+head,c=lane*W;
@@ -194,9 +173,9 @@ template<int D> __device__ __forceinline__ void vsa_quantize_token(
     float qr[W],kr[W],vr[W];
     if constexpr(D==128){
         if(valid){
-            read_contiguous<D>(k,src,dtype,kr);
-            read_contiguous<D>(v,src,dtype,vr);
-            if(query_valid)read_contiguous<D>(q,src,dtype,qr);
+            read_contiguous<D>(k,src,BF16,kr);
+            read_contiguous<D>(v,src,BF16,vr);
+            if(query_valid)read_contiguous<D>(q,src,BF16,qr);
             else{
                 #pragma unroll
                 for(int j=0;j<W;++j)qr[j]=0;
@@ -208,9 +187,9 @@ template<int D> __device__ __forceinline__ void vsa_quantize_token(
     }else{
         #pragma unroll
         for(int j=0;j<W;++j) {
-            qr[j]=valid && query_valid ? read_input(q,src+j,dtype) : 0;
-            kr[j]=valid ? read_input(k,src+j,dtype) : 0;
-            vr[j]=valid ? read_input(v,src+j,dtype) : 0;
+            qr[j]=valid && query_valid ? read_input(q,src+j,BF16) : 0;
+            kr[j]=valid ? read_input(k,src+j,BF16) : 0;
+            vr[j]=valid ? read_input(v,src+j,BF16) : 0;
         }
     }
     rotate_contiguous<D,true>(qr,kr,scale);
@@ -234,14 +213,14 @@ template<int D> __device__ __forceinline__ void vsa_quantize_token(
 template<int D> __device__ void vsa_quantize_impl(
     const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
     const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
-    int source_n,int padded_n,int query_n,int query_offset,int h,int dtype,int metadata_mask,float scale) {
+    int source_n,int padded_n,int query_n,int query_offset,int h,int metadata_mask,float scale) {
     // Grid-stride over tokens (grid.x is capped at 4 x SMs by the launcher); a warp owns every gridDim.x*4-th token.
     // padded_n is a multiple of the 128/256 block (prepare_vsa validates it), so first < padded_n implies first + warp <
     // padded_n: loop control on the CTA's first token is provably warp-uniform and the rotate's shuffles need no
     // collective fallback.
     int warp=threadIdx.x/32, token=blockIdx.x*4+warp, stride=gridDim.x*4;
     if constexpr(D==128) {
-        if(dtype==0 && ((((unsigned long long)q)|((unsigned long long)k)|((unsigned long long)v))&7)==0) {
+        if(((((unsigned long long)q)|((unsigned long long)k)|((unsigned long long)v))&7)==0) {
             // BF16, 8B-aligned: (b,h) scales held in registers, next token's loads issued before this token's rotate.
             int lane=threadIdx.x%32, head=blockIdx.y, batch=blockIdx.z, bh=batch*h+head, c=lane*4;
             float qscale=qs[bh], kscale=ks[bh], km[4], vscale[4];
@@ -283,16 +262,16 @@ template<int D> __device__ void vsa_quantize_impl(
         }
     }
     for(int first=blockIdx.x*4;first<padded_n;first+=stride,token+=stride)  // warp-uniform, as above
-        vsa_quantize_token<D>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale,token);
+        vsa_quantize_token<D>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,metadata_mask,scale,token);
 }
 
 extern "C" __global__ void vsa_quantize(
     const void *q,const void *k,const void *v,const void *source_map,const void *query_map,
     const float *kmean,const float *qs,const float *ks,const float *vs,uint8_t *oq,uint8_t *ok,uint8_t *ov,
-    int source_n,int padded_n,int query_n,int query_offset,int h,int d,int dtype,int metadata_mask) {
+    int source_n,int padded_n,int query_n,int query_offset,int h,int d,int metadata_mask) {
     float scale=rsqrtf((float)d);
-    if(d==64) vsa_quantize_impl<64>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale);
-    else vsa_quantize_impl<128>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,dtype,metadata_mask,scale);
+    if(d==64) vsa_quantize_impl<64>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,metadata_mask,scale);
+    else vsa_quantize_impl<128>(q,k,v,source_map,query_map,kmean,qs,ks,vs,oq,ok,ov,source_n,padded_n,query_n,query_offset,h,metadata_mask,scale);
 }
 
 extern "C" __global__ void vsa_reduce(const float *stats, float *kmean,

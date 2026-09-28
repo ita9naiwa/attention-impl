@@ -1,8 +1,6 @@
 import contextlib
 import itertools
 import json
-import tempfile
-from pathlib import Path
 
 import torch
 from flash_attn.cute import vc_vsa_preprocess as vsa
@@ -102,8 +100,15 @@ def test_vsa_preparation():
     with torch.no_grad():
         for block in (128, 256):
             for d in (64, 128):
-                for dtype in (torch.bfloat16, torch.float16, torch.float32):
-                    case(block, d, dtype)
+                case(block, d, torch.bfloat16)
+        for dtype in (torch.float16, torch.float32):  # BF16-only producer
+            values, m, s_, qm = make_inputs(128, 128, dtype)
+            try:
+                run(values, m, s_, qm, 128)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(("non-BF16 input accepted", dtype))
         for metadata_dtypes in itertools.product((torch.int32, torch.int64), repeat=3):
             case(128, 64, torch.bfloat16, 1, 2, metadata_dtypes)
         values, m, s, qm, _, _ = case(
@@ -206,36 +211,6 @@ def canonical_like(tiles=16, h=8, d=128):
     return values, source_map, sizes, query_map, source_n - 256
 
 
-def ungrouped_library():
-    """vc_vsa_preprocess.cu with the grouped D128 stats loads undone: the three original read_contiguous calls."""
-    src = Path(vsa.__file__).with_suffix(".cu").read_text()
-    call = "read_qkv_contiguous<D>(q,k,v,base+lane*W,dtype,rawq,rawk,rawv);"
-    assert src.count(call) == 1
-    loads = "\n                ".join(
-        f"read_contiguous<D>({x},base+lane*W,dtype,raw{x});" for x in "qkv"
-    )
-    helper = src[src.index("// Stats D128:") : src.index("__device__ int64_t vsa_index")]
-    src = src.replace(call, loads).replace(helper, "")
-    saved = vsa.__file__
-    with tempfile.TemporaryDirectory() as tmp:
-        (Path(tmp) / "vc_vsa_preprocess.cu").write_text(src)
-        vsa.__file__ = str(Path(tmp) / "vc_vsa_preprocess.py")
-        try:
-            return vsa._library.__wrapped__(torch.cuda.current_device())
-        finally:
-            vsa.__file__ = saved
-
-
-@contextlib.contextmanager
-def using(library):
-    saved = vsa._library
-    vsa._library = lambda device: library
-    try:
-        yield
-    finally:
-        vsa._library = saved
-
-
 def raw(x):
     return x.detach().contiguous().reshape(-1).view(torch.uint8)
 
@@ -285,95 +260,6 @@ def special(x, kind):
     return x
 
 
-@torch.no_grad()
-def test_vsa_stats_grouped_loads_raw_bytes():
-    """Raw-byte parity of the grouped D128 stats loads against the original per-input loads."""
-    torch.manual_seed(20260927)
-    torch.zeros(1, device="cuda")  # the driver-API module load needs the primary context
-    base = ungrouped_library()
-    new = vsa._library(torch.cuda.current_device())
-
-    def both(values, m, s, qm, block, query_tokens=None):
-        out = []
-        for library in (base, new):
-            with using(library):
-                out.append(snapshot(run(values, m, s, qm, block, query_tokens)))
-        return out
-
-    offsets = [
-        (0, 0, 0),
-        (1, 1, 1),
-        (2, 2, 2),
-        (3, 3, 3),
-        (4, 4, 4),
-        (0, 1, 0),
-        (0, 0, 2),
-        (3, 0, 0),
-    ]
-    metadata = list(itertools.product((torch.int32, torch.int64), repeat=3))
-    cases = 0
-    for n, (block, d, dtype, kind) in enumerate(
-        itertools.product(
-            (128, 256),
-            (64, 128),
-            (torch.bfloat16, torch.float16, torch.float32),
-            ("normal", "finite", "nonfinite"),
-        )
-    ):
-        values, m, s, qm = make_inputs(block, d, dtype, 2, 3, metadata[n % 8])
-        values = [special(x, kind) for x in values]
-        for offset in offsets if dtype == torch.bfloat16 else offsets[:2] + offsets[5:6]:
-            placed_values = [placed(x, o) for x, o in zip(values, offset)]
-            if dtype == torch.bfloat16:
-                assert [x.data_ptr() % 8 != 0 for x in placed_values] == [
-                    o % 4 != 0 for o in offset
-                ]
-            a, b = both(placed_values, m, s, qm, block)
-            assert_raw(a, b, (block, d, dtype, kind, offset))
-            cases += 1
-        a, b = both(
-            values, m, s, torch.full_like(qm, -1), block, query_tokens=0
-        )  # every query invalid
-        assert_raw(a, b, (block, d, dtype, kind, "no queries"))
-    values, m, s, qm, nq = canonical_like()
-    for offset in offsets[:3]:
-        v = [placed(x, o) for x, o in zip(values, offset)]
-        assert_raw(*both(v, m, s, qm, 256, query_tokens=nq), ("canonical", offset))
-    print(f"cold raw-byte parity PASS ({cases} cases)", flush=True)
-
-    # Aligned D128 BF16 (the grouped branch) over all 8 int32/int64 metadata mixes.
-    for block, mix in itertools.product((128, 256), metadata):
-        values, m, s, qm = make_inputs(block, 128, torch.bfloat16, 2, 3, mix)
-        assert all(x.data_ptr() % 8 == 0 for x in values)
-        assert_raw(*both(values, m, s, qm, block), ("aligned D128 metadata", block, mix))
-    print("aligned D128 BF16 all metadata mixes raw-byte parity PASS", flush=True)
-
-    # Changed inputs, eager and CUDA graph replay; aligned and unaligned BF16 D128.
-    for offset in ((0, 0, 0), (1, 0, 3)):
-        values, m, s, qm = make_inputs(256, 128, torch.bfloat16)
-        values = [placed(x, o) for x, o in zip(values, offset)]
-        for step in range(3):
-            for x in values:
-                x.copy_(torch.randn_like(x) * (1 + step))
-            assert_raw(*both(values, m, s, qm, 256), ("eager changed input", offset, step))
-        graphs, captured = [], []
-        for library in (base, new):
-            with using(library):
-                run(values, m, s, qm, 256)
-                torch.cuda.synchronize()
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    captured.append(run(values, m, s, qm, 256))
-                graphs.append(graph)
-        for gain in (1.0, 1.0, 5.0, 1.0):
-            for x in values:
-                x.copy_(torch.randn_like(x) * gain)
-            for graph in graphs:
-                graph.replay()
-            assert_raw(*(snapshot(c) for c in captured), ("graph replay", offset, gain))
-    print("changed-input eager and graph replay raw-byte parity PASS", flush=True)
-
-
 @contextlib.contextmanager
 def sm_count(n):
     saved = vsa._sm_count
@@ -415,5 +301,4 @@ def test_vsa_producer_prefetch_raw_bytes():
 
 if __name__ == "__main__":
     test_vsa_preparation()
-    test_vsa_stats_grouped_loads_raw_bytes()
     test_vsa_producer_prefetch_raw_bytes()

@@ -95,8 +95,8 @@ def prepare_vsa(
         raise ValueError("Fused VSA VC preparation is inference-only")
     if q.ndim != 4 or min(q.shape) <= 0 or q.shape[-1] not in (64, 128):
         raise ValueError("expected nonempty BSHD input with D=64/128")
-    if not q.is_cuda or q.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise ValueError("expected CUDA BF16/FP16/FP32 input")
+    if not q.is_cuda or q.dtype != torch.bfloat16:
+        raise ValueError("expected CUDA BF16 input")
     if any(
         x.shape != q.shape or x.dtype != q.dtype or x.device != q.device or not x.is_contiguous()
         for x in (q, k, v)
@@ -146,7 +146,6 @@ def prepare_vsa(
             for _ in range(2)
         )
         stream = torch.cuda.current_stream(q.device).cuda_stream
-        dtype = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}[q.dtype]
         metadata_mask = sum(
             (x.dtype == torch.int64) << i
             for i, x in enumerate((padded_to_original, padded_to_query, variable_block_sizes))
@@ -156,7 +155,7 @@ def prepare_vsa(
             (blocks, h, b),
             256,
             [q, k, v, padded_to_original, padded_to_query, variable_block_sizes, stats, *pools],
-            [source_n, blocks, h, d, block_size, query_tokens, query_offset, dtype, metadata_mask],
+            [source_n, blocks, h, d, block_size, query_tokens, query_offset, metadata_mask],
             stream,
         )
         _launch(
@@ -172,7 +171,7 @@ def prepare_vsa(
             (min((padded_n + 3) // 4, 4 * _sm_count(q.device)), h, b),
             128,
             [q, k, v, padded_to_original, padded_to_query, kmean, qs, ks, vs, oq, ok, ov],
-            [source_n, padded_n, query_tokens, query_offset, h, d, dtype, metadata_mask],
+            [source_n, padded_n, query_tokens, query_offset, h, d, metadata_mask],
             stream,
         )
     return {"q": oq, "k": ok, "v": ov, "qs": qs, "ks": ks, "vs": vs}, pools
