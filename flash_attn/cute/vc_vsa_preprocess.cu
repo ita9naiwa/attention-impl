@@ -337,13 +337,6 @@ __device__ __forceinline__ int vsa_route_parent(
  return (int)(global - document_start);
 }
 
-// Route sort key: full tiles by parent id, then partial tiles (offset by parents), invalid or empty parents last.
-constexpr int ROUTE_NONE=2147483647;
-__device__ __forceinline__ int vsa_route_key(int parent, const int *sizes, int block_size, int parents) {
- int size=parent>=0?sizes[parent]:0;
- return size==block_size?parent:(size>0&&size<block_size?parent+parents:ROUTE_NONE);
-}
-
 extern "C" __global__ void vsa_routes(
  const int64_t *selected, const int *sizes, int *full_idx, int *full_cnt,
  int *mask_idx, int *mask_cnt, int rows, int topk, int prefix,
@@ -392,7 +385,8 @@ extern "C" __global__ void vsa_routes_sorted(
  int total=prefix+topk, n=1; while(n<total)n*=2;
  for(int i=tid;i<n;i+=blockDim.x){
   int p=i<total?vsa_route_parent(selected,row,topk,i,prefix,document_start,parents):-1;
-  keys[i]=vsa_route_key(p,sizes,block_size,parents);
+  int sz=p>=0?sizes[p]:0;
+  keys[i]=sz==block_size?p:(sz>0&&sz<block_size?p+parents:2147483647);
  }
  __syncthreads();
  for(int k=2;k<=n;k*=2)for(int j=k/2;j>0;j/=2){
@@ -400,7 +394,7 @@ extern "C" __global__ void vsa_routes_sorted(
    if(other>i){int a=keys[i],b=keys[other]; if((a>b)==((i&k)==0)){keys[i]=b;keys[other]=a;}}
   } __syncthreads();
  }
- if(tid==0){nf=0;nm=0;for(int i=0;i<total;i++){nf+=keys[i]<parents;nm+=keys[i]>=parents&&keys[i]<ROUTE_NONE;}
+ if(tid==0){nf=0;nm=0;for(int i=0;i<total;i++){nf+=keys[i]<parents;nm+=keys[i]>=parents&&keys[i]<2147483647;}
   full_cnt[row]=nf*(block_size/128);mask_cnt[row]=nm*(block_size/128);}
  __syncthreads();
  int factor=block_size/128;int64_t offset=(int64_t)row*capacity;
@@ -418,7 +412,8 @@ extern "C" __global__ void vsa_routes_warp(
  int lane=threadIdx.x%32, row=blockIdx.x*4+threadIdx.x/32;
  if (row>=rows) return;
  int parent=lane<prefix+topk?vsa_route_parent(selected,row,topk,lane,prefix,document_start,parents):-1;
- int key=vsa_route_key(parent,sizes,block_size,parents);
+ int size=parent>=0?sizes[parent]:0;
+ int key=size==block_size?parent:(size>0&&size<block_size?parent+parents:2147483647);
  #pragma unroll
  for (int k=2;k<=32;k*=2) {
   #pragma unroll
@@ -429,12 +424,12 @@ extern "C" __global__ void vsa_routes_warp(
   }
  }
  int nf=__popc(__ballot_sync(0xffffffff,key<parents));
- int nm=__popc(__ballot_sync(0xffffffff,key>=parents&&key<ROUTE_NONE));
+ int nm=__popc(__ballot_sync(0xffffffff,key>=parents&&key<2147483647));
  int factor=block_size/128;int64_t offset=(int64_t)row*capacity;
  for(int i=lane;i<capacity;i+=32){full_idx[offset+i]=-1;mask_idx[offset+i]=-1;}
  __syncwarp();
  if(lane==0){full_cnt[row]=nf*factor;mask_cnt[row]=nm*factor;}
- if(key<ROUTE_NONE){
+ if(key<2147483647){
   bool full=key<parents;int rank=full?lane:lane-nf;
   int *out=full?full_idx:mask_idx;int p=full?key:key-parents;
   for(int child=0;child<factor;++child)out[offset+rank*factor+child]=p*factor+child;
